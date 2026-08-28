@@ -1,58 +1,148 @@
 # crook
 
-The shepherd's staff: one shared library for every herdr plugin in this stable.
+Crook is a Rust library for Herdr plugin authors. It provides a bounded client
+for Herdr's Unix-socket API and resolves the environment variables Herdr passes
+to plugins.
 
-## Why this exists
+Crook returns raw `serde_json::Value` results. Plugins remain responsible for
+their RPC-specific types, validation, and behavior.
 
-Six plugins (shear, collide, standup, pulse, redact, tether) were built independently, and
-an inventory of all six found the same infrastructure written over and over. Ranked by how
-many copies exist today:
+## Requirements
 
-| Concern | Copies | ~LOC per copy |
-| --- | --- | --- |
-| Herdr socket client — NDJSON over `HERDR_SOCKET_PATH`, redial per call, 15s timeout, 4 MiB response cap, one transport retry, envelope/ID validation, protocol-vs-transport error split | 6/6 | 380–1,800 |
-| Plugin environment — `HERDR_PLUGIN_ID` / `HERDR_PLUGIN_STATE_DIR` / `HERDR_PLUGIN_CONFIG_DIR` resolution with XDG/Home fallbacks | 6/6 | 80–170 |
-| Release & CI tooling — `check_release.py`, `herdr_api_contract.py`, ci/release/upstream-canary workflows; same filenames in every repo, content drifting apart | 6/6 | (Python) |
-| `--setup` config.toml splicer — backup, additive splice, reload through herdr, byte-for-byte restore on failed reload, explicit rollback | 4 | 420–700 |
-| Badge/daemon lifecycle — enabled/pid markers, flock ownership, TTL token plans, clear-before-set, disable sweep, startup `--restore` re-arm | 3 (+1 planned) | 1,000–1,400 |
-| TUI runtime — raw-mode/alt-screen guard restored on Drop/panic/SIGINT/SIGTERM, crossterm poll/key-gating, mouse hit maps, theme conventions | 3 fresh + 1 older | ~450 |
-| Unicode/ANSI display width, ellipsis truncation, wrapping | 4 | 150–450 |
-| Atomic state files — flock, tmp+rename, directory sync | 4 | ~150 |
+- Rust 1.80 or newer
+- Linux or macOS
+- A running Herdr server for socket requests
 
-Every copy is a place a bug fix does not reach. crook is where those fixes land once.
+## Installation
 
-## Shape
-
-One crate, feature-gated modules, consumed as a git dependency pinned to tagged releases:
+Pin a released tag and commit `Cargo.lock`:
 
 ```toml
-crook = { git = "https://github.com/moneycaringcoder/herdr-crook", tag = "v0.x.y", features = ["client", "tui"] }
+[dependencies]
+crook = { git = "https://github.com/moneycaringcoder/herdr-crook", tag = "v0.1.0" }
+serde_json = "1"
 ```
 
-- `client` — the socket transport, request/response envelope, and the small set of RPCs
-  everyone calls (`session.snapshot` as a raw value, `workspace.report_metadata`,
-  notifications, config reload). Plugin environment and socket-path resolution live here.
-- `fmt` — display width, truncation, wrapping, byte/age formatting.
-- `tui` — terminal lifecycle guard, event loop scaffolding, key/mouse mapping, hit-testing,
-  and the visual conventions (theme-inheriting colors, whole-row reversed cursor, bold
-  colored tags only, no dim, no background fills off the cursor row).
-- `setup` — the config.toml splice/backup/reload/rollback machinery behind every `--setup`.
-- `daemon` — marker/lock lifecycle, token planning and push/sweep for badge updaters.
-- `fs` — atomic state-file writes and advisory locking.
+Crook has no feature flags. Its only non-standard-library dependency is
+`serde_json`.
 
-## What deliberately stays out
+## Quick start
 
-Domain logic never moves here. Each plugin keeps its own:
+```rust
+use crook::client::{Client, RetrySafety};
+use crook::env::PluginEnv;
+use serde_json::json;
 
-- snapshot *reducers* (what a plugin extracts from `session.snapshot` is its identity),
-- state machines and verdict/severity semantics,
-- git plumbing policy (what to ask git and what the answers mean),
-- rendering content (crook provides width math, not sentences).
+fn load_snapshot() -> Result<serde_json::Value, crook::client::Error> {
+    let env = PluginEnv::resolve("example.plugin");
+    let client = Client::connect(env.socket_path(), env.plugin_id())?;
 
-The test of belonging: if two plugins would ever legitimately want different behavior from
-the same function, it does not belong in crook.
+    client.request(
+        "session.snapshot",
+        json!({}),
+        RetrySafety::Idempotent,
+    )
+}
+```
 
-## Naming
+`Client::connect` performs a preflight connection probe and retries it once
+after 150 ms on a transport failure. The successful probe connection is
+discarded. `Client::new` constructs the same client without opening the socket.
 
-Repository `herdr-crook`, crate `crook` — same convention as `herdr-shear`/`shear`.
-A crook is the one tool every shepherd carries.
+## Sending requests
+
+```rust
+// After constructing a Client as shown above:
+let result = client.request(
+    "workspace.report_metadata",
+    serde_json::json!({
+        "workspace_id": "w1",
+        "tokens": {"build": "passing"}
+    }),
+    RetrySafety::Never,
+)?;
+```
+
+Request parameters must be a JSON object. Crook:
+
+- opens one Unix-socket connection per request;
+- sends one newline-delimited JSON request;
+- assigns string IDs using the prefix supplied to `Client`;
+- applies 15-second read and write deadlines;
+- rejects response lines larger than 4 MiB;
+- requires the response ID to match the request ID;
+- requires exactly one of `result` or `error`;
+- returns the owned `result` value.
+
+### Retry safety
+
+Choose retry behavior for every request:
+
+- `RetrySafety::Never` performs one attempt. Use it when repeating a request
+  could repeat a state change.
+- `RetrySafety::Idempotent` retries once, after 150 ms, only when the first
+  attempt fails at the transport layer.
+
+Protocol errors, invalid response contracts, and oversized responses are never
+retried. A retry reuses the original request ID.
+
+## Errors
+
+`crook::client::Error` separates four failure classes:
+
+| Variant | Meaning |
+| --- | --- |
+| `Transport` | The socket could not be connected to, written to, or read from. |
+| `Protocol` | Herdr returned an error code and message. |
+| `Contract` | The request or response did not match the wire contract. |
+| `ResponseTooLarge` | The response exceeded the 4 MiB limit. |
+
+Use `Error::protocol_code()` when callers need Herdr's stable error code.
+
+## Plugin environment
+
+```rust
+use crook::env::PluginEnv;
+
+let env = PluginEnv::resolve("example.plugin");
+
+println!("plugin: {}", env.plugin_id());
+println!("socket: {}", env.socket_path().display());
+println!("state: {}", env.state_dir().display());
+println!("config: {}", env.config_dir().display());
+```
+
+A non-blank UTF-8 `HERDR_PLUGIN_ID` takes precedence over the supplied default.
+Non-blank injected path variables take precedence and are preserved unchanged,
+including relative and non-UTF-8 paths.
+
+| Value | Herdr variable | Fallback |
+| --- | --- | --- |
+| Plugin ID | `HERDR_PLUGIN_ID` | Default passed to `PluginEnv::resolve` |
+| Socket | `HERDR_SOCKET_PATH` | `<config-base>/herdr/herdr.sock` |
+| State directory | `HERDR_PLUGIN_STATE_DIR` | `<state-base>/herdr/plugins/<plugin-id>` |
+| Config directory | `HERDR_PLUGIN_CONFIG_DIR` | `<config-base>/herdr/plugins/config/<plugin-id>` |
+
+Each base is resolved independently. `config-base` uses an absolute
+`XDG_CONFIG_HOME`, then an absolute `HOME/.config`. `state-base` uses an
+absolute `XDG_STATE_HOME`, then an absolute `HOME/.local/state`. If a base has
+neither source, it uses `<system-temp>/herdr-no-home`.
+
+Blank environment values are treated as unset.
+
+## Scope
+
+Crook v0.1 provides:
+
+- bounded request/response transport for the Herdr Unix socket;
+- request ID and response-envelope validation;
+- explicit retry safety;
+- plugin ID, socket, state-directory, and config-directory resolution.
+
+Crook v0.1 does not provide:
+
+- typed wrappers for individual Herdr RPCs;
+- snapshot reducers or plugin domain types;
+- plugin state machines, rendering, or policy;
+- persistent connections or event subscriptions;
+- configurable timeout or response-size policies.

@@ -1,0 +1,7 @@
+//! Shared infrastructure for Herdr plugins.
+//!
+//! Crook owns protocol and environment mechanics. Plugins retain their domain
+//! reducers, state machines, rendering content, and policy.
+
+pub mod client;
+pub mod env;
