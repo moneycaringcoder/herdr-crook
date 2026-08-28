@@ -27,7 +27,7 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
 
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -49,7 +49,7 @@ jobs:
       - name: Install minimum Rust
         run: rustup toolchain install 1.80.0 --profile minimal
 
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: msrv
 
