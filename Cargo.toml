@@ -7,6 +7,10 @@ description = "Shared infrastructure for Herdr plugins"
 license = "MIT"
 repository = "https://github.com/moneycaringcoder/herdr-crook"
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
 serde_json = "1"
 

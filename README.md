@@ -24,8 +24,8 @@ crook = { git = "https://github.com/moneycaringcoder/herdr-crook", tag = "v0.2.0
 serde_json = "1"
 ```
 
-Crook has no feature flags. It depends on `serde_json` and, on Unix targets,
-`libc` for advisory directory locks.
+The optional `test-support` feature is off by default. Crook depends on
+`serde_json` and, on Unix targets, `libc` for advisory directory locks.
 
 ## Quick start
 
@@ -49,6 +49,32 @@ fn load_snapshot() -> Result<serde_json::Value, crook::client::Error> {
 `Client::connect` performs a preflight connection probe and retries it once
 after 150 ms on a transport failure. The successful probe connection is
 discarded. `Client::new` constructs the same client without opening the socket.
+
+## Testing your plugin
+
+Enable `test-support` on the Crook entry in your plugin's development
+dependencies. It provides a real Unix-socket fixture server without adding
+runtime dependencies:
+
+```rust
+use crook::client::{Client, RetrySafety};
+use crook::test_support::{FixtureReply, FixtureServer};
+use serde_json::json;
+
+let server = FixtureServer::new([
+    FixtureReply::result(json!({"ready": true})),
+])?;
+let client = Client::new(server.socket_path(), "example.test");
+let result = client.request("session.snapshot", json!({}), RetrySafety::Never)?;
+
+assert_eq!(result, json!({"ready": true}));
+assert_eq!(server.requests().len(), 1);
+```
+
+`FixtureReply` also scripts protocol errors, raw bytes, oversized lines,
+unterminated streams, and EOF. `CapturedEnvelope` loads whole response
+envelopes or bare results from strings and files while replacing request IDs.
+`EnvGuard` serializes process-environment changes and restores prior values.
 
 ## Sending requests
 
