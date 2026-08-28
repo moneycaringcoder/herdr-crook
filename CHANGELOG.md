@@ -4,6 +4,11 @@ All notable changes to Crook are recorded here. Crook follows [Semantic Versioni
 
 ## [Unreleased]
 
+### Changed
+
+- Require response lines to end with a newline. EOF before the delimiter is a
+  transport failure, so idempotent requests may retry.
+
 ### Fixed
 
 - Preserve arbitrarily deep snapshot object views and their exact validation
@@ -12,11 +17,19 @@ All notable changes to Crook are recorded here. Crook follows [Semantic Versioni
   requested mode after writing, and clean up staged files during unwinding.
 - Prevent fixture-server shutdown from blocking on accepted sockets whose I/O
   timeouts could not be installed.
+- Enforced total write and response-read deadlines and retried interrupted
+  socket operations.
+- Rejected path-escaping plugin IDs and kept the no-home fallback absolute when
+  the system temporary-directory environment is invalid.
+- Covered default and `test-support` configurations in CI, including MSRV and
+  documentation tests.
 
 ### Documentation
 
 - Clarify that newly created parent directories are not separately synced into
   their ancestors.
+- Compile-checked README examples and synchronized installation and release
+  guidance with the current API.
 
 ## [0.2.1] - 2026-08-28
 

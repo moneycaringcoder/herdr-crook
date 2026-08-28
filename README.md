@@ -20,7 +20,7 @@ Pin a released tag and commit `Cargo.lock`:
 
 ```toml
 [dependencies]
-crook = { git = "https://github.com/moneycaringcoder/herdr-crook", tag = "v0.2.0" }
+crook = { git = "https://github.com/moneycaringcoder/herdr-crook", tag = "v0.2.1" }
 serde_json = "1"
 ```
 
@@ -47,8 +47,11 @@ fn load_snapshot() -> Result<serde_json::Value, crook::client::Error> {
 ```
 
 `Client::connect` performs a preflight connection probe and retries it once
-after 150 ms on a transport failure. The successful probe connection is
+after 150 ms on a potentially transient transport failure. Invalid-input and
+unsupported failures return immediately. The successful probe connection is
 discarded. `Client::new` constructs the same client without opening the socket.
+The operating system's blocking connect call is outside the read and write
+deadlines.
 
 ## Testing your plugin
 
@@ -61,14 +64,17 @@ use crook::client::{Client, RetrySafety};
 use crook::test_support::{FixtureReply, FixtureServer};
 use serde_json::json;
 
-let server = FixtureServer::new([
-    FixtureReply::result(json!({"ready": true})),
-])?;
-let client = Client::new(server.socket_path(), "example.test");
-let result = client.request("session.snapshot", json!({}), RetrySafety::Never)?;
+fn fixture_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
+    let server = FixtureServer::new([
+        FixtureReply::result(json!({"ready": true})),
+    ])?;
+    let client = Client::new(server.socket_path(), "example.test");
+    let result = client.request("session.snapshot", json!({}), RetrySafety::Never)?;
 
-assert_eq!(result, json!({"ready": true}));
-assert_eq!(server.requests().len(), 1);
+    assert_eq!(result, json!({"ready": true}));
+    assert_eq!(server.requests().len(), 1);
+    Ok(())
+}
 ```
 
 `FixtureReply` also scripts protocol errors, raw bytes, oversized lines,
@@ -79,15 +85,19 @@ envelopes or bare results from strings and files while replacing request IDs.
 ## Sending requests
 
 ```rust
-// After constructing a Client as shown above:
-let result = client.request(
-    "workspace.report_metadata",
-    serde_json::json!({
-        "workspace_id": "w1",
-        "tokens": {"build": "passing"}
-    }),
-    RetrySafety::Never,
-)?;
+use crook::client::{Client, Error, RetrySafety};
+use serde_json::{json, Value};
+
+fn report_metadata(client: &Client) -> Result<Value, Error> {
+    client.request(
+        "workspace.report_metadata",
+        json!({
+            "workspace_id": "w1",
+            "tokens": {"build": "passing"}
+        }),
+        RetrySafety::Never,
+    )
+}
 ```
 
 Request parameters must be a JSON object. Crook:
@@ -95,7 +105,9 @@ Request parameters must be a JSON object. Crook:
 - opens one Unix-socket connection per request;
 - sends one newline-delimited JSON request;
 - assigns string IDs using the prefix supplied to `Client`;
-- applies 15-second read and write deadlines;
+- enforces separate 15-second total budgets for the write and response-read
+  phases;
+- requires the response line to end with a newline;
 - rejects response lines larger than 4 MiB;
 - requires the response ID to match the request ID;
 - requires exactly one of `result` or `error`;
@@ -111,7 +123,11 @@ Choose retry behavior for every request:
   attempt fails at the transport layer.
 
 Protocol errors, invalid response contracts, and oversized responses are never
-retried. A retry reuses the original request ID.
+retried. A retry reuses the original request ID. A transport failure can happen
+after Herdr received part or all of the first request, so select `Idempotent`
+only when repeating the operation is safe. EOF before the response newline is a
+transport failure and follows that retry policy even when the preceding bytes
+form complete JSON.
 
 ## Errors
 
@@ -155,23 +171,30 @@ created parent directories are not separately synced into their ancestors.
 ## Plugin environment
 
 ```rust
-use crook::env::{PluginContext, PluginEnv};
+use crook::env::{PluginContext, PluginContextError, PluginEnv};
 
-let env = PluginEnv::resolve("example.plugin");
+fn inspect_environment() -> Result<(), PluginContextError> {
+    let env = PluginEnv::resolve("example.plugin");
 
-println!("plugin: {}", env.plugin_id());
-println!("socket: {}", env.socket_path().display());
-println!("state: {}", env.state_dir().display());
-println!("config: {}", env.config_dir().display());
+    println!("plugin: {}", env.plugin_id());
+    println!("socket: {}", env.socket_path().display());
+    println!("state: {}", env.state_dir().display());
+    println!("config: {}", env.config_dir().display());
 
-if let Some(context) = PluginContext::resolve()? {
-    let invocation_cwd = context
-        .focused_pane_cwd()
-        .or_else(|| context.workspace_cwd());
+    if let Some(context) = PluginContext::resolve()? {
+        if let Some(invocation_cwd) = context
+            .focused_pane_cwd()
+            .or_else(|| context.workspace_cwd())
+        {
+            println!("invoked from: {}", invocation_cwd.display());
+        }
+    }
+    Ok(())
 }
 ```
 
-A non-blank UTF-8 `HERDR_PLUGIN_ID` takes precedence over the supplied default.
+A non-blank UTF-8 path-component `HERDR_PLUGIN_ID` takes precedence over the
+supplied default. Other values fall back to that default.
 Non-blank socket, state, and config path variables take precedence and are
 preserved unchanged, including relative and non-UTF-8 paths.
 
@@ -190,11 +213,12 @@ absolute `XDG_STATE_HOME`, then an absolute `HOME/.local/state`. If a base has
 neither source, it uses `<system-temp>/herdr-no-home`.
 
 `PluginContext::resolve` validates the known workspace and focused-pane fields
-while tolerating unknown fields added by Herdr. A present malformed context,
-wrong known-field type, or relative cwd is an error. Installed plugin commands
-run from `HERDR_PLUGIN_ROOT`, so consumers must use the invocation context
-instead of treating the process cwd as the user's repository. `plugin_root()` is
-`Some` only when Herdr supplies an absolute path.
+while tolerating unknown fields added by Herdr. A present malformed or
+non-Unicode context, wrong known-field type, or relative cwd is an error. Blank
+and whitespace-only known string fields are treated as absent. Installed plugin
+commands run from `HERDR_PLUGIN_ROOT`, so consumers must use the invocation
+context instead of treating the process cwd as the user's repository.
+`plugin_root()` is `Some` only when Herdr supplies an absolute path.
 
 Blank environment values are treated as unset.
 

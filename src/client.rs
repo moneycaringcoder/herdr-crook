@@ -5,6 +5,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 
@@ -23,6 +25,9 @@ pub enum RetrySafety {
     /// Never repeat the request.
     Never,
     /// Repeat the request once if, and only if, transport failed.
+    ///
+    /// A transport failure can happen after Herdr received the first request,
+    /// so use this only when repeating the operation is safe.
     Idempotent,
 }
 
@@ -176,7 +181,7 @@ fn preflight_with(
     mut sleep: impl FnMut(Duration),
 ) -> Result<(), Error> {
     match attempt() {
-        Err(first @ Error::Transport(_)) => {
+        Err(first @ Error::Transport(_)) if retryable_preflight_failure(&first) => {
             sleep(RETRY_BACKOFF);
             match attempt() {
                 Err(second @ Error::Transport(_)) => Err(combine_transport_failures(first, second)),
@@ -185,6 +190,17 @@ fn preflight_with(
         }
         outcome => outcome,
     }
+}
+
+fn retryable_preflight_failure(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Transport(source)
+            if !matches!(
+                source.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+            )
+    )
 }
 
 fn combine_transport_failures(first: Error, second: Error) -> Error {
@@ -206,7 +222,14 @@ fn dial(socket_path: &Path) -> io::Result<UnixStream> {
             format!("cannot reach herdr at {}: {error}", socket_path.display()),
         )
     })?;
-    stream.set_read_timeout(Some(IO_TIMEOUT)).map_err(|error| {
+    set_read_timeout(&stream, socket_path, IO_TIMEOUT)?;
+    set_write_timeout(&stream, socket_path, IO_TIMEOUT)?;
+    Ok(stream)
+}
+
+#[cfg(unix)]
+fn set_read_timeout(stream: &UnixStream, socket_path: &Path, timeout: Duration) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout)).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!(
@@ -214,19 +237,123 @@ fn dial(socket_path: &Path) -> io::Result<UnixStream> {
                 socket_path.display()
             ),
         )
-    })?;
-    stream
-        .set_write_timeout(Some(IO_TIMEOUT))
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "cannot set write timeout for {}: {error}",
-                    socket_path.display()
-                ),
-            )
-        })?;
-    Ok(stream)
+    })
+}
+
+#[cfg(unix)]
+fn set_write_timeout(stream: &UnixStream, socket_path: &Path, timeout: Duration) -> io::Result<()> {
+    stream.set_write_timeout(Some(timeout)).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot set write timeout for {}: {error}",
+                socket_path.display()
+            ),
+        )
+    })
+}
+
+#[cfg(unix)]
+fn refresh_read_timeout(
+    stream: &UnixStream,
+    socket_path: &Path,
+    timeout: Duration,
+) -> Result<(), Error> {
+    match set_read_timeout(stream, socket_path, timeout) {
+        Ok(()) => Ok(()),
+        // Darwin can reject SO_RCVTIMEO after peer close while bytes remain
+        // buffered. The prior timeout may outlive the remaining total budget
+        // for another EINVAL cause, so keep this tolerance Apple-only.
+        #[cfg(target_vendor = "apple")]
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(error) => Err(Error::transport(error)),
+    }
+}
+
+#[cfg(unix)]
+fn refresh_write_timeout(
+    stream: &UnixStream,
+    socket_path: &Path,
+    timeout: Duration,
+) -> Result<(), Error> {
+    match set_write_timeout(stream, socket_path, timeout) {
+        Ok(()) => Ok(()),
+        // Darwin reports EINVAL after peer close; let write expose BrokenPipe.
+        #[cfg(target_vendor = "apple")]
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(error) => Err(Error::transport(error)),
+    }
+}
+
+#[cfg(unix)]
+fn deadline_error(operation: &str, socket_path: &Path, timeout: Duration) -> Error {
+    Error::transport(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "{operation} {} exceeded the {timeout:?} deadline",
+            socket_path.display()
+        ),
+    ))
+}
+
+#[cfg(unix)]
+fn remaining_timeout(
+    deadline: Instant,
+    operation: &str,
+    socket_path: &Path,
+    timeout: Duration,
+) -> Result<Duration, Error> {
+    let now = Instant::now();
+    if now >= deadline {
+        Err(deadline_error(operation, socket_path, timeout))
+    } else {
+        Ok(deadline - now)
+    }
+}
+
+#[cfg(unix)]
+fn write_request(
+    stream: &mut UnixStream,
+    socket_path: &Path,
+    mut encoded: &[u8],
+    timeout: Duration,
+) -> Result<(), Error> {
+    let deadline = Instant::now() + timeout;
+    while !encoded.is_empty() {
+        let remaining = remaining_timeout(deadline, "write to", socket_path, timeout)?;
+        refresh_write_timeout(stream, socket_path, remaining)?;
+        match stream.write(encoded) {
+            Ok(0) => {
+                return Err(Error::transport(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!("write to {} returned zero bytes", socket_path.display()),
+                )))
+            }
+            Ok(written) => encoded = &encoded[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(deadline_error("write to", socket_path, timeout))
+            }
+            Err(error) => {
+                return Err(Error::transport(io::Error::new(
+                    error.kind(),
+                    format!("write to {} failed: {error}", socket_path.display()),
+                )))
+            }
+        }
+    }
+
+    stream.flush().map_err(|error| {
+        Error::transport(io::Error::new(
+            error.kind(),
+            format!("flush to {} failed: {error}", socket_path.display()),
+        ))
+    })
 }
 
 #[cfg(not(unix))]
@@ -243,18 +370,7 @@ fn dial(socket_path: &Path) -> io::Result<()> {
 #[cfg(unix)]
 fn request_once(socket_path: &Path, id: &str, encoded: &[u8]) -> Result<Value, Error> {
     let mut stream = dial(socket_path).map_err(Error::transport)?;
-    stream.write_all(encoded).map_err(|error| {
-        Error::transport(io::Error::new(
-            error.kind(),
-            format!("write to {} failed: {error}", socket_path.display()),
-        ))
-    })?;
-    stream.flush().map_err(|error| {
-        Error::transport(io::Error::new(
-            error.kind(),
-            format!("flush to {} failed: {error}", socket_path.display()),
-        ))
-    })?;
+    write_request(&mut stream, socket_path, encoded, IO_TIMEOUT)?;
 
     let response = read_response_line(&mut stream, socket_path)?;
     parse_response(response, id)
@@ -268,27 +384,56 @@ fn request_once(socket_path: &Path, _id: &str, _encoded: &[u8]) -> Result<Value,
 
 #[cfg(unix)]
 fn read_response_line(stream: &mut UnixStream, socket_path: &Path) -> Result<Vec<u8>, Error> {
+    read_response_line_with_timeout(stream, socket_path, IO_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn read_response_line_with_timeout(
+    stream: &mut UnixStream,
+    socket_path: &Path,
+    timeout: Duration,
+) -> Result<Vec<u8>, Error> {
+    let deadline = Instant::now() + timeout;
     let mut response = Vec::new();
     let mut chunk = [0_u8; 8192];
 
     loop {
-        let read = stream.read(&mut chunk).map_err(|error| {
-            Error::transport(io::Error::new(
-                error.kind(),
-                format!("read from {} failed: {error}", socket_path.display()),
-            ))
-        })?;
-        if read == 0 {
-            if response.is_empty() {
-                return Err(Error::transport(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "herdr at {} closed the connection without answering",
-                        socket_path.display()
-                    ),
-                )));
+        let remaining = remaining_timeout(deadline, "read from", socket_path, timeout)?;
+        refresh_read_timeout(stream, socket_path, remaining)?;
+        let read = match stream.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(deadline_error("read from", socket_path, timeout))
             }
-            break;
+            Err(error) => {
+                return Err(Error::transport(io::Error::new(
+                    error.kind(),
+                    format!("read from {} failed: {error}", socket_path.display()),
+                )))
+            }
+        };
+        if read == 0 {
+            let message = if response.is_empty() {
+                format!(
+                    "herdr at {} closed the connection without answering",
+                    socket_path.display()
+                )
+            } else {
+                format!(
+                    "herdr at {} closed the connection before terminating its response line",
+                    socket_path.display()
+                )
+            };
+            return Err(Error::transport(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                message,
+            )));
         }
 
         let newline = chunk[..read].iter().position(|byte| *byte == b'\n');
@@ -309,11 +454,9 @@ fn read_response_line(stream: &mut UnixStream, socket_path: &Path) -> Result<Vec
         }
         response.extend_from_slice(&chunk[..line_bytes]);
         if newline.is_some() {
-            break;
+            return Ok(response);
         }
     }
-
-    Ok(response)
 }
 
 fn parse_response(bytes: Vec<u8>, expected_id: &str) -> Result<Value, Error> {
@@ -382,6 +525,7 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard};
     use std::thread::{self, JoinHandle};
     use std::time::Instant;
 
@@ -389,6 +533,61 @@ mod tests {
 
     static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
     const MOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+    static SIGNAL_LOCK: Mutex<()> = Mutex::new(());
+
+    extern "C" fn noop_signal_handler(_: libc::c_int) {}
+
+    struct SignalGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous: libc::sigaction,
+    }
+
+    impl SignalGuard {
+        fn install() -> Self {
+            let lock = SIGNAL_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // SAFETY: sigaction is a plain C struct and every field is filled
+            // before it is passed to libc.
+            let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+            action.sa_sigaction = noop_signal_handler as *const () as usize;
+            action.sa_flags = 0;
+            // SAFETY: action.sa_mask points to initialized writable storage.
+            assert_eq!(unsafe { libc::sigemptyset(&mut action.sa_mask) }, 0);
+            // SAFETY: previous points to valid writable storage and action
+            // remains alive for the duration of the call.
+            let mut previous = unsafe { std::mem::zeroed::<libc::sigaction>() };
+            assert_eq!(
+                unsafe { libc::sigaction(libc::SIGUSR2, &action, &mut previous) },
+                0
+            );
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for SignalGuard {
+        fn drop(&mut self) {
+            // SAFETY: previous came from sigaction and remains initialized.
+            let _ = unsafe { libc::sigaction(libc::SIGUSR2, &self.previous, std::ptr::null_mut()) };
+        }
+    }
+
+    fn current_thread_id() -> usize {
+        // SAFETY: pthread_self has no preconditions.
+        unsafe { libc::pthread_self() as usize }
+    }
+
+    fn interrupt_thread(thread: usize) {
+        // SAFETY: thread is captured from pthread_self while that thread lives.
+        assert_eq!(
+            unsafe { libc::pthread_kill(thread as libc::pthread_t, libc::SIGUSR2) },
+            0
+        );
+    }
 
     struct TestSocket {
         path: PathBuf,
@@ -573,6 +772,30 @@ mod tests {
     }
 
     #[test]
+    fn unterminated_response_is_a_transport_failure() {
+        let (socket, server) = spawn_server(|listener| {
+            let mut stream = accept(&listener);
+            let request = read_request(&mut stream);
+            let response = serde_json::to_vec(&json!({
+                "id": request["id"],
+                "result": "missing newline"
+            }))
+            .expect("encode unterminated response");
+            stream
+                .write_all(&response)
+                .expect("write unterminated response");
+        });
+        let client = Client::new(&socket.path, "unterminated");
+
+        let error = client
+            .request("test", json!({}), RetrySafety::Never)
+            .expect_err("unterminated response");
+
+        assert!(matches!(error, Error::Transport(_)));
+        server.join().expect("mock server");
+    }
+
+    #[test]
     fn response_has_exactly_one_result_or_error() {
         let both = serde_json::to_vec(&json!({
             "id": "shape:1",
@@ -588,6 +811,89 @@ mod tests {
                 matches!(&error, Error::Contract(message) if message.contains("`result`") && message.contains("`error`"))
             );
         }
+    }
+
+    #[test]
+    fn slow_drip_cannot_extend_total_read_deadline() {
+        let (mut reader, mut writer) = UnixStream::pair().expect("create socket pair");
+        let writer = thread::spawn(move || {
+            for _ in 0..100 {
+                if writer.write_all(b"x").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let timeout = Duration::from_millis(200);
+        let started = Instant::now();
+
+        let error = read_response_line_with_timeout(&mut reader, Path::new("socketpair"), timeout)
+            .expect_err("slow drip must time out");
+        let elapsed = started.elapsed();
+        drop(reader);
+        writer.join().expect("slow-drip writer");
+
+        assert!(matches!(
+            error,
+            Error::Transport(source) if source.kind() == io::ErrorKind::TimedOut
+        ));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "slow drip extended the deadline to {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn interrupted_read_continues_to_the_response() {
+        let _signal = SignalGuard::install();
+        let target = current_thread_id();
+        let (mut reader, mut writer) = UnixStream::pair().expect("create socket pair");
+        let responder = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            interrupt_thread(target);
+            thread::sleep(Duration::from_millis(50));
+            writer
+                .write_all(b"response\n")
+                .expect("write response after interrupt");
+        });
+
+        let response = read_response_line_with_timeout(
+            &mut reader,
+            Path::new("socketpair"),
+            Duration::from_secs(1),
+        )
+        .expect("read must resume after EINTR");
+
+        assert_eq!(response, b"response");
+        responder.join().expect("interrupting responder");
+    }
+
+    #[test]
+    fn interrupted_blocked_write_respects_total_deadline() {
+        let _signal = SignalGuard::install();
+        let target = current_thread_id();
+        let (mut writer, _reader) = UnixStream::pair().expect("create socket pair");
+        let interrupter = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            interrupt_thread(target);
+        });
+        let timeout = Duration::from_millis(200);
+        let payload = vec![0_u8; 8 * 1024 * 1024];
+        let started = Instant::now();
+
+        let error = write_request(&mut writer, Path::new("socketpair"), &payload, timeout)
+            .expect_err("blocked write must time out");
+        let elapsed = started.elapsed();
+        interrupter.join().expect("write interrupter");
+
+        assert!(matches!(
+            error,
+            Error::Transport(source) if source.kind() == io::ErrorKind::TimedOut
+        ));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "blocked write extended the deadline to {elapsed:?}"
+        );
     }
 
     #[test]
@@ -654,8 +960,18 @@ mod tests {
             }))
             .expect("encode oversized response");
             assert_eq!(response.len(), MAX_RESPONSE_BYTES + 1);
-            let _ = stream.write_all(&response);
-            let _ = stream.write_all(b"\n");
+            stream
+                .write_all(&response)
+                .expect("write oversized response");
+            stream
+                .set_read_timeout(Some(MOCK_TIMEOUT))
+                .expect("bound close wait");
+            let mut closed = [0_u8; 1];
+            assert_eq!(
+                stream.read(&mut closed).expect("await client close"),
+                0,
+                "client must close after rejecting the oversized line"
+            );
         });
         let client = Client::new(&socket.path, "over");
 
@@ -789,6 +1105,56 @@ mod tests {
 
         assert_eq!(attempts.get(), 2);
         assert_eq!(sleeps.take(), vec![RETRY_BACKOFF]);
+    }
+
+    #[test]
+    fn connect_preflight_retries_interrupted_failure() {
+        let attempts = std::cell::Cell::new(0_u8);
+        let sleeps = std::cell::Cell::new(Vec::new());
+
+        preflight_with(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(Error::transport(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "interrupted dial",
+                    )))
+                } else {
+                    Ok(())
+                }
+            },
+            |duration| {
+                let mut recorded = sleeps.take();
+                recorded.push(duration);
+                sleeps.set(recorded);
+            },
+        )
+        .expect("interrupted preflight retry succeeds");
+
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(sleeps.take(), vec![RETRY_BACKOFF]);
+    }
+
+    #[test]
+    fn connect_preflight_does_not_retry_permanent_failures() {
+        for kind in [io::ErrorKind::InvalidInput, io::ErrorKind::Unsupported] {
+            let attempts = std::cell::Cell::new(0_u8);
+            let error = preflight_with(
+                || {
+                    attempts.set(attempts.get() + 1);
+                    Err(Error::transport(io::Error::new(kind, "permanent dial")))
+                },
+                |_| panic!("permanent failure must not sleep"),
+            )
+            .expect_err("permanent preflight failure");
+
+            assert_eq!(attempts.get(), 1);
+            assert!(matches!(
+                error,
+                Error::Transport(source) if source.kind() == kind
+            ));
+        }
     }
 
     #[test]

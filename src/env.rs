@@ -177,11 +177,12 @@ pub struct PluginEnv {
 impl PluginEnv {
     /// Resolve the environment for a plugin.
     ///
-    /// Paths injected by herdr are authoritative. Otherwise, XDG base
-    /// directories are used when absolute, followed by an absolute `HOME`, and
-    /// finally a directory beneath the system temporary directory.
+    /// Paths injected by herdr are authoritative. Injected plugin IDs must be
+    /// non-blank UTF-8 path components. Otherwise, XDG base directories are
+    /// used when absolute, followed by an absolute `HOME`, and finally a
+    /// directory beneath the system temporary directory.
     pub fn resolve(default_plugin_id: &str) -> Self {
-        let temp_dir = env::temp_dir();
+        let temp_dir = absolute_system_temp(env::temp_dir());
         Self::resolve_with(default_plugin_id, |name| env::var_os(name), &temp_dir)
     }
 
@@ -258,6 +259,23 @@ fn valid_plugin_id(value: OsString) -> Option<String> {
         .into_string()
         .ok()
         .filter(|value| !value.trim().is_empty())
+        .filter(|value| {
+            let mut components = Path::new(value).components();
+            matches!(
+                components.next(),
+                Some(std::path::Component::Normal(component))
+                    if component == std::ffi::OsStr::new(value.as_str())
+            ) && components.next().is_none()
+        })
+}
+
+fn absolute_system_temp(temp_dir: PathBuf) -> PathBuf {
+    #[cfg(unix)]
+    if !temp_dir.is_absolute() {
+        return PathBuf::from("/tmp");
+    }
+
+    temp_dir
 }
 
 fn non_blank_path(value: Option<OsString>) -> Option<PathBuf> {
@@ -457,6 +475,24 @@ mod tests {
     }
 
     #[test]
+    fn path_escaping_plugin_ids_fall_back_to_the_default() {
+        for unsafe_id in ["/tmp/escape", "../escape", ".", "nested/", "nested/."] {
+            let vars = [(PLUGIN_ID_ENV, OsString::from(unsafe_id))];
+            let resolved = resolve(&vars, Path::new("/tmp/crook-test"));
+
+            assert_eq!(resolved.plugin_id(), "default.plugin");
+            assert_eq!(
+                resolved.state_dir(),
+                Path::new("/tmp/crook-test/herdr-no-home/herdr/plugins/default.plugin")
+            );
+            assert_eq!(
+                resolved.config_dir(),
+                Path::new("/tmp/crook-test/herdr-no-home/herdr/plugins/config/default.plugin")
+            );
+        }
+    }
+
+    #[test]
     fn relative_plugin_root_is_unset() {
         let vars = text_vars(&[(PLUGIN_ROOT_ENV, "relative/plugin")]);
 
@@ -542,6 +578,20 @@ mod tests {
         assert_eq!(
             resolved.config_dir(),
             Path::new("/tmp/crook-test/herdr-no-home/herdr/plugins/config/default.plugin")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_temp_fallback_is_always_absolute() {
+        assert_eq!(
+            absolute_system_temp(PathBuf::from("relative-temp")),
+            Path::new("/tmp")
+        );
+        assert_eq!(absolute_system_temp(PathBuf::new()), Path::new("/tmp"));
+        assert_eq!(
+            absolute_system_temp(PathBuf::from("/var/tmp/custom")),
+            Path::new("/var/tmp/custom")
         );
     }
 
