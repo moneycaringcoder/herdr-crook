@@ -10,13 +10,19 @@ Crook releases are immutable Git tags. Consumers pin exact tags and commit their
    ```bash
    cargo fmt --all -- --check
    cargo test --all-targets --locked
+   cargo test --all-targets --locked --features test-support
+   cargo test --doc --locked --features test-support
    cargo clippy --all-targets --locked -- -D warnings
+   cargo clippy --all-targets --locked --features test-support -- -D warnings
    cargo +1.80.0 test --all-targets --locked
+   cargo +1.80.0 test --all-targets --locked --features test-support
    ```
 
 3. Move the entries under `Unreleased` in `CHANGELOG.md` into a versioned section with the release date.
 4. Confirm `Cargo.toml` contains the release version and correct MSRV.
-5. Review the public API, README examples, and error/retry behavior for compatibility with the intended semantic version.
+5. Review the public API, error/retry behavior, and README examples for
+   compatibility with the intended semantic version. Update the README
+   installation snippet to the release tag.
 
 ## Publish
 

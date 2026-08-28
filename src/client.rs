@@ -5,6 +5,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 
@@ -23,6 +25,9 @@ pub enum RetrySafety {
     /// Never repeat the request.
     Never,
     /// Repeat the request once if, and only if, transport failed.
+    ///
+    /// A transport failure can happen after Herdr received the first request,
+    /// so use this only when repeating the operation is safe.
     Idempotent,
 }
 
@@ -200,13 +205,26 @@ fn combine_transport_failures(first: Error, second: Error) -> Error {
 
 #[cfg(unix)]
 fn dial(socket_path: &Path) -> io::Result<UnixStream> {
-    let stream = UnixStream::connect(socket_path).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("cannot reach herdr at {}: {error}", socket_path.display()),
-        )
-    })?;
-    stream.set_read_timeout(Some(IO_TIMEOUT)).map_err(|error| {
+    let stream = loop {
+        match UnixStream::connect(socket_path) {
+            Ok(stream) => break stream,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("cannot reach herdr at {}: {error}", socket_path.display()),
+                ))
+            }
+        }
+    };
+    set_read_timeout(&stream, socket_path, IO_TIMEOUT)?;
+    set_write_timeout(&stream, socket_path, IO_TIMEOUT)?;
+    Ok(stream)
+}
+
+#[cfg(unix)]
+fn set_read_timeout(stream: &UnixStream, socket_path: &Path, timeout: Duration) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout)).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!(
@@ -214,19 +232,107 @@ fn dial(socket_path: &Path) -> io::Result<UnixStream> {
                 socket_path.display()
             ),
         )
-    })?;
-    stream
-        .set_write_timeout(Some(IO_TIMEOUT))
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "cannot set write timeout for {}: {error}",
-                    socket_path.display()
-                ),
-            )
-        })?;
-    Ok(stream)
+    })
+}
+
+#[cfg(unix)]
+fn set_write_timeout(stream: &UnixStream, socket_path: &Path, timeout: Duration) -> io::Result<()> {
+    stream.set_write_timeout(Some(timeout)).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot set write timeout for {}: {error}",
+                socket_path.display()
+            ),
+        )
+    })
+}
+
+#[cfg(unix)]
+fn deadline_error(operation: &str, socket_path: &Path, timeout: Duration) -> Error {
+    Error::transport(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "{operation} {} exceeded the {timeout:?} deadline",
+            socket_path.display()
+        ),
+    ))
+}
+
+#[cfg(unix)]
+fn remaining_timeout(
+    deadline: Instant,
+    operation: &str,
+    socket_path: &Path,
+    timeout: Duration,
+) -> Result<Duration, Error> {
+    let now = Instant::now();
+    if now >= deadline {
+        Err(deadline_error(operation, socket_path, timeout))
+    } else {
+        Ok(deadline - now)
+    }
+}
+
+#[cfg(unix)]
+fn write_request(
+    stream: &mut UnixStream,
+    socket_path: &Path,
+    mut encoded: &[u8],
+    timeout: Duration,
+) -> Result<(), Error> {
+    let deadline = Instant::now() + timeout;
+    while !encoded.is_empty() {
+        let remaining = remaining_timeout(deadline, "write to", socket_path, timeout)?;
+        set_write_timeout(stream, socket_path, remaining).map_err(Error::transport)?;
+        match stream.write(encoded) {
+            Ok(0) => {
+                return Err(Error::transport(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!("write to {} returned zero bytes", socket_path.display()),
+                )))
+            }
+            Ok(written) => encoded = &encoded[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(deadline_error("write to", socket_path, timeout))
+            }
+            Err(error) => {
+                return Err(Error::transport(io::Error::new(
+                    error.kind(),
+                    format!("write to {} failed: {error}", socket_path.display()),
+                )))
+            }
+        }
+    }
+
+    loop {
+        let remaining = remaining_timeout(deadline, "write to", socket_path, timeout)?;
+        set_write_timeout(stream, socket_path, remaining).map_err(Error::transport)?;
+        match stream.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(deadline_error("write to", socket_path, timeout))
+            }
+            Err(error) => {
+                return Err(Error::transport(io::Error::new(
+                    error.kind(),
+                    format!("flush to {} failed: {error}", socket_path.display()),
+                )))
+            }
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -243,18 +349,7 @@ fn dial(socket_path: &Path) -> io::Result<()> {
 #[cfg(unix)]
 fn request_once(socket_path: &Path, id: &str, encoded: &[u8]) -> Result<Value, Error> {
     let mut stream = dial(socket_path).map_err(Error::transport)?;
-    stream.write_all(encoded).map_err(|error| {
-        Error::transport(io::Error::new(
-            error.kind(),
-            format!("write to {} failed: {error}", socket_path.display()),
-        ))
-    })?;
-    stream.flush().map_err(|error| {
-        Error::transport(io::Error::new(
-            error.kind(),
-            format!("flush to {} failed: {error}", socket_path.display()),
-        ))
-    })?;
+    write_request(&mut stream, socket_path, encoded, IO_TIMEOUT)?;
 
     let response = read_response_line(&mut stream, socket_path)?;
     parse_response(response, id)
@@ -268,27 +363,56 @@ fn request_once(socket_path: &Path, _id: &str, _encoded: &[u8]) -> Result<Value,
 
 #[cfg(unix)]
 fn read_response_line(stream: &mut UnixStream, socket_path: &Path) -> Result<Vec<u8>, Error> {
+    read_response_line_with_timeout(stream, socket_path, IO_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn read_response_line_with_timeout(
+    stream: &mut UnixStream,
+    socket_path: &Path,
+    timeout: Duration,
+) -> Result<Vec<u8>, Error> {
+    let deadline = Instant::now() + timeout;
     let mut response = Vec::new();
     let mut chunk = [0_u8; 8192];
 
     loop {
-        let read = stream.read(&mut chunk).map_err(|error| {
-            Error::transport(io::Error::new(
-                error.kind(),
-                format!("read from {} failed: {error}", socket_path.display()),
-            ))
-        })?;
-        if read == 0 {
-            if response.is_empty() {
-                return Err(Error::transport(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "herdr at {} closed the connection without answering",
-                        socket_path.display()
-                    ),
-                )));
+        let remaining = remaining_timeout(deadline, "read from", socket_path, timeout)?;
+        set_read_timeout(stream, socket_path, remaining).map_err(Error::transport)?;
+        let read = match stream.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(deadline_error("read from", socket_path, timeout))
             }
-            break;
+            Err(error) => {
+                return Err(Error::transport(io::Error::new(
+                    error.kind(),
+                    format!("read from {} failed: {error}", socket_path.display()),
+                )))
+            }
+        };
+        if read == 0 {
+            let message = if response.is_empty() {
+                format!(
+                    "herdr at {} closed the connection without answering",
+                    socket_path.display()
+                )
+            } else {
+                format!(
+                    "herdr at {} closed the connection before terminating its response line",
+                    socket_path.display()
+                )
+            };
+            return Err(Error::transport(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                message,
+            )));
         }
 
         let newline = chunk[..read].iter().position(|byte| *byte == b'\n');
@@ -309,11 +433,9 @@ fn read_response_line(stream: &mut UnixStream, socket_path: &Path) -> Result<Vec
         }
         response.extend_from_slice(&chunk[..line_bytes]);
         if newline.is_some() {
-            break;
+            return Ok(response);
         }
     }
-
-    Ok(response)
 }
 
 fn parse_response(bytes: Vec<u8>, expected_id: &str) -> Result<Value, Error> {
@@ -573,6 +695,33 @@ mod tests {
     }
 
     #[test]
+    fn unterminated_response_is_a_transport_failure() {
+        let (socket, server) = spawn_server(|listener| {
+            let mut stream = accept(&listener);
+            let request = read_request(&mut stream);
+            let response = serde_json::to_vec(&json!({
+                "id": request["id"],
+                "result": "missing newline"
+            }))
+            .expect("encode unterminated response");
+            stream
+                .write_all(&response)
+                .expect("write unterminated response");
+        });
+        let client = Client::new(&socket.path, "unterminated");
+
+        let error = client
+            .request("test", json!({}), RetrySafety::Never)
+            .expect_err("unterminated response");
+
+        assert!(matches!(
+            error,
+            Error::Transport(source) if source.kind() == io::ErrorKind::UnexpectedEof
+        ));
+        server.join().expect("mock server");
+    }
+
+    #[test]
     fn response_has_exactly_one_result_or_error() {
         let both = serde_json::to_vec(&json!({
             "id": "shape:1",
@@ -588,6 +737,36 @@ mod tests {
                 matches!(&error, Error::Contract(message) if message.contains("`result`") && message.contains("`error`"))
             );
         }
+    }
+
+    #[test]
+    fn slow_drip_cannot_extend_total_read_deadline() {
+        let (mut reader, mut writer) = UnixStream::pair().expect("create socket pair");
+        let writer = thread::spawn(move || {
+            for _ in 0..100 {
+                if writer.write_all(b"x").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let timeout = Duration::from_millis(200);
+        let started = Instant::now();
+
+        let error = read_response_line_with_timeout(&mut reader, Path::new("socketpair"), timeout)
+            .expect_err("slow drip must time out");
+        let elapsed = started.elapsed();
+        drop(reader);
+        writer.join().expect("slow-drip writer");
+
+        assert!(matches!(
+            error,
+            Error::Transport(source) if source.kind() == io::ErrorKind::TimedOut
+        ));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "slow drip extended the deadline to {elapsed:?}"
+        );
     }
 
     #[test]

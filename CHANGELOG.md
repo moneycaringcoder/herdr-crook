@@ -12,11 +12,19 @@ All notable changes to Crook are recorded here. Crook follows [Semantic Versioni
   requested mode after writing, and clean up staged files during unwinding.
 - Prevent fixture-server shutdown from blocking on accepted sockets whose I/O
   timeouts could not be installed.
+- Enforced total write and response-read deadlines, retried interrupted socket
+  operations, and rejected unterminated NDJSON responses as transport failures.
+- Rejected path-escaping plugin IDs and kept the no-home fallback absolute when
+  the system temporary-directory environment is invalid.
+- Covered default and `test-support` configurations in CI, including MSRV and
+  documentation tests.
 
 ### Documentation
 
 - Clarify that newly created parent directories are not separately synced into
   their ancestors.
+- Compile-checked README examples and synchronized installation and release
+  guidance with the current API.
 
 ## [0.2.1] - 2026-08-28
 
@@ -53,3 +61,4 @@ All notable changes to Crook are recorded here. Crook follows [Semantic Versioni
 [0.2.1]: https://github.com/moneycaringcoder/herdr-crook/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/moneycaringcoder/herdr-crook/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/moneycaringcoder/herdr-crook/releases/tag/v0.1.0
+[Unreleased]: https://github.com/moneycaringcoder/herdr-crook/compare/v0.2.1...HEAD

@@ -11,3 +11,7 @@ pub mod rpc;
 pub mod snapshot;
 #[cfg(all(feature = "test-support", unix))]
 pub mod test_support;
+
+#[cfg(all(doctest, feature = "test-support", unix))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
