@@ -1,0 +1,46 @@
+name: API proposal
+description: Propose a shared Crook capability or contract change
+title: "proposal: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What plugin-author problem cannot be solved with the current API?
+    validations:
+      required: true
+
+  - type: textarea
+    id: consumers
+    attributes:
+      label: Consumers and shared contract
+      description: Name the consumers that need the same observable behavior and describe that behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed API
+      description: Show the smallest public API and its error, retry, and compatibility behavior.
+      render: rust
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Explain why the behavior should not remain plugin-local.
+    validations:
+      required: true
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility impact
+      description: Note public API, wire behavior, MSRV, platform, and dependency changes.
+    validations:
+      required: true

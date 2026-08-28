@@ -1,0 +1,75 @@
+name: Bug report
+description: Report incorrect Crook behavior
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report vulnerabilities here. Use the private security-reporting link in SECURITY.md.
+
+  - type: input
+    id: version
+    attributes:
+      label: Crook version
+      description: Tag or full commit ID.
+      placeholder: v0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Operating system, architecture, and Rust version.
+      placeholder: Ubuntu 24.04, x86_64, rustc 1.80.0
+    validations:
+      required: true
+
+  - type: input
+    id: herdr
+    attributes:
+      label: Herdr version
+      description: Herdr version and protocol number, when relevant.
+      placeholder: Herdr 0.8.2, protocol 20
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest code or steps that reproduce the problem. Remove secrets and private data.
+      render: rust
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the complete error classification and message when available.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Relevant logs, socket behavior, or environment variables with sensitive values removed.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I removed credentials, tokens, private data, and unrelated logs.
+          required: true
+        - label: I checked existing issues for the same problem.
+          required: true
