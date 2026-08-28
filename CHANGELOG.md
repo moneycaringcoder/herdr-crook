@@ -11,6 +11,8 @@ All notable changes to Crook are recorded here. Crook follows [Semantic Versioni
   notification delivery verdicts.
 - Unix atomic replacement, mode-aware create-new, non-clobbering backup, and
   directory-lock primitives.
+- Opt-in `test-support` feature with a scripted Unix-socket server, scoped
+  environment guard, request capture, and captured-response loaders.
 
 ## [0.2.0] - 2026-08-28
 
