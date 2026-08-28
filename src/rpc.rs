@@ -20,6 +20,11 @@ pub enum Error {
     Client(client::Error),
     /// A successful `session.snapshot` response had an invalid structure.
     Snapshot(SnapshotError),
+    /// A successful RPC result violated that method's structural contract.
+    Contract {
+        method: &'static str,
+        message: String,
+    },
 }
 
 impl Error {
@@ -27,7 +32,7 @@ impl Error {
     pub fn protocol_code(&self) -> Option<&str> {
         match self {
             Self::Client(error) => error.protocol_code(),
-            Self::Snapshot(_) => None,
+            Self::Snapshot(_) | Self::Contract { .. } => None,
         }
     }
 }
@@ -36,7 +41,10 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Client(error) => error.fmt(f),
-            Self::Snapshot(error) => write!(f, "invalid session.snapshot structure: {error}"),
+            Self::Snapshot(error) => error.fmt(f),
+            Self::Contract { method, message } => {
+                write!(f, "invalid {method} result: {message}")
+            }
         }
     }
 }
@@ -46,6 +54,7 @@ impl std::error::Error for Error {
         match self {
             Self::Client(error) => Some(error),
             Self::Snapshot(error) => Some(error),
+            Self::Contract { .. } => None,
         }
     }
 }
@@ -60,6 +69,15 @@ impl From<SnapshotError> for Error {
     fn from(error: SnapshotError) -> Self {
         Self::Snapshot(error)
     }
+}
+
+/// The structural delivery verdict returned by `notification.show`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationDelivery {
+    /// Whether Herdr displayed the notification.
+    pub shown: bool,
+    /// Herdr's non-blank delivery reason.
+    pub reason: String,
 }
 
 /// Selects one of the two `worktree.list` request shapes used by Herdr plugins.
@@ -81,31 +99,64 @@ pub fn session_snapshot(client: &Client) -> Result<Snapshot, Error> {
     Snapshot::from_result(result).map_err(Error::from)
 }
 
-/// Shows a notification with the title and body shape used by Herdr plugins.
+/// Shows a notification and returns Herdr's decoded delivery verdict.
 ///
 /// The request is never retried because an interrupted successful request could
-/// otherwise display the same notification twice. A successful result payload
-/// is intentionally ignored.
-pub fn notification_show(client: &Client, title: &str, body: &str) -> Result<(), Error> {
+/// otherwise display the same notification twice. The response must identify a
+/// `notification_show` result and contain boolean `shown` plus a non-blank
+/// `reason`; plugins retain responsibility for mapping reason strings into
+/// domain-specific delivery states.
+pub fn notification_show(
+    client: &Client,
+    title: &str,
+    body: &str,
+) -> Result<NotificationDelivery, Error> {
     let mut params = Map::new();
     params.insert("title".into(), Value::String(title.to_owned()));
     params.insert("body".into(), Value::String(body.to_owned()));
-    client.request(
+    let result = client.request(
         "notification.show",
         Value::Object(params),
         RetrySafety::Never,
     )?;
-    Ok(())
+    if result.get("type").and_then(Value::as_str) != Some("notification_show") {
+        return Err(Error::Contract {
+            method: "notification.show",
+            message: "expected result `type` to be `notification_show`".into(),
+        });
+    }
+    let shown = result
+        .get("shown")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| Error::Contract {
+            method: "notification.show",
+            message: "required `shown` must be a boolean".into(),
+        })?;
+    let reason = result
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .ok_or_else(|| Error::Contract {
+            method: "notification.show",
+            message: "required `reason` must be a non-empty string".into(),
+        })?;
+    Ok(NotificationDelivery {
+        shown,
+        reason: reason.to_owned(),
+    })
 }
 
 /// Applies a workspace token merge patch through `workspace.report_metadata`.
 ///
 /// `Some(value)` sets a token and `None` serializes as JSON `null` to clear only
 /// that token. Empty patches perform no request. Patches larger than Herdr's
-/// sixteen-token limit are sent in ordered chunks. A supplied TTL is clamped to
-/// Herdr's accepted `1..=86_400_000` millisecond range and is omitted from every
-/// pure-clear chunk, because Herdr rejects a TTL that has no set value to govern.
-/// Mutating requests are never retried.
+/// sixteen-token limit are split by `BTreeMap` key order into independent server
+/// mutations. A later failure can therefore leave earlier chunks applied; a
+/// related clear/set pair is atomic only when both names remain in one chunk.
+/// A supplied TTL is clamped to Herdr's accepted `1..=86_400_000` millisecond
+/// range and is omitted from every pure-clear chunk, because Herdr rejects a TTL
+/// that has no set value to govern. Mutating requests are never retried.
 pub fn workspace_report_metadata(
     client: &Client,
     workspace_id: &str,
@@ -309,7 +360,13 @@ mod tests {
 
         let error = session_snapshot(&client).expect_err("invalid snapshot");
 
-        assert!(matches!(error, Error::Snapshot(_)));
+        assert!(matches!(&error, Error::Snapshot(_)));
+        assert_eq!(
+            error.to_string(),
+            "invalid session.snapshot result: expected result `type` to be `session_snapshot`; \
+             available metadata: result type `changed`, snapshot version missing, snapshot \
+             protocol missing"
+        );
         server.join().expect("mock server");
     }
 
@@ -331,8 +388,67 @@ mod tests {
         });
         let client = Client::new(&socket.path, "rpc-notification");
 
-        notification_show(&client, "Build", "Passing").expect("show notification");
+        let delivery = notification_show(&client, "Build", "Passing").expect("show notification");
+        assert_eq!(
+            delivery,
+            NotificationDelivery {
+                shown: true,
+                reason: "shown".into()
+            }
+        );
 
+        server.join().expect("mock server");
+    }
+
+    #[test]
+    fn notification_returns_suppressed_delivery_verdict() {
+        let (socket, server) = spawn_server(|listener| {
+            let mut stream = accept(&listener);
+            let request = read_request(&mut stream);
+            write_result(
+                &mut stream,
+                &request,
+                json!({
+                    "type": "notification_show",
+                    "shown": false,
+                    "reason": " rate_limited "
+                }),
+            );
+        });
+        let client = Client::new(&socket.path, "rpc-notification-verdict");
+
+        let delivery =
+            notification_show(&client, "Build", "Delayed").expect("notification verdict");
+
+        assert!(!delivery.shown);
+        assert_eq!(delivery.reason, "rate_limited");
+        server.join().expect("mock server");
+    }
+
+    #[test]
+    fn notification_rejects_malformed_delivery_verdict() {
+        let (socket, server) = spawn_server(|listener| {
+            let mut stream = accept(&listener);
+            let request = read_request(&mut stream);
+            write_result(
+                &mut stream,
+                &request,
+                json!({
+                    "type": "notification_show",
+                    "shown": false,
+                    "reason": " "
+                }),
+            );
+        });
+        let client = Client::new(&socket.path, "rpc-notification-invalid");
+
+        let error =
+            notification_show(&client, "Build", "Delayed").expect_err("blank reason is invalid");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid notification.show result: required `reason` must be a non-empty string"
+        );
         server.join().expect("mock server");
     }
 

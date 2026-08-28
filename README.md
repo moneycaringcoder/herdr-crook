@@ -105,24 +105,25 @@ Use `Error::protocol_code()` when callers need Herdr's stable error code.
 `Snapshot::from_result` validates the `session_snapshot` result type, nested
 `snapshot` object, and its `workspaces`, `panes`, and `agents` arrays. Borrowed
 record views provide lenient field access, strict field checks with indexed JSON
-paths, path access, and ordered workspace/pane/agent ID joins. They do not parse
-plugin domain state or normalize paths.
+paths, whitespace-trimming path access, and ordered workspace/pane/agent ID
+joins. They do not parse plugin domain state or apply path normalization policy.
 
 ## Common RPCs
 
 `crook::rpc` wraps only `session.snapshot`, `notification.show`,
 `workspace.report_metadata`, and `worktree.list`. The wrappers build the request
 shapes used by Herdr plugins, select the established retry safety, preserve
-protocol error codes, enforce metadata merge-patch and TTL rules, and leave
-plugin-specific worktree reduction to callers.
+protocol error codes, decode notification delivery verdicts, enforce metadata
+merge-patch and TTL rules, and leave plugin-specific worktree reduction to
+callers.
 
 ## Durable files
 
 On Unix, `crook::fs` provides atomic replacement with file and containing
-directory sync, an explicit-mode variant for private files, durable
-non-clobbering `0o600` backups, and a directory-scoped RAII `flock` guard. A
-directory-sync error after publication is returned without rolling back the
-already-published file.
+directory sync, an explicit-mode variant for private files, mode-aware durable
+create-new publication from in-memory bytes, non-clobbering `0o600` path
+backups, and a directory-scoped RAII `flock` guard. A directory-sync error after
+publication is returned without rolling back the already-published file.
 
 ## Plugin environment
 

@@ -13,6 +13,10 @@ static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Atomically replaces `path` with `bytes` using default file permissions.
 ///
+/// The replacement does not inherit the mode of an existing target: its mode is
+/// `0o666` filtered by the process umask. Callers replacing a private file must
+/// use [`atomic_replace_with_mode`].
+///
 /// The parent directory is created when necessary. Bytes are written to a
 /// unique sibling temporary file and `sync_all` is called before rename. After
 /// rename, the containing directory is synced so the new directory entry is
@@ -31,28 +35,40 @@ pub fn atomic_replace_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Res
     atomic_replace_inner(path, bytes, Some(mode), sync_directory)
 }
 
+/// Creates a durable file without overwriting an existing destination.
+///
+/// Bytes are written and synced in a sibling temporary file created with the
+/// exact Unix `mode`. A same-directory hard link publishes that complete file
+/// at `path`; publication fails atomically with [`io::ErrorKind::AlreadyExists`]
+/// when the destination exists. Temporary cleanup is best-effort after
+/// publication, then the containing directory is synced. A directory-sync
+/// failure is returned after publication without deleting the new file.
+pub fn create_new(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    create_new_inner(
+        path,
+        mode,
+        |staged| staged.write_all(bytes),
+        |temp| fs::remove_file(temp),
+        sync_directory,
+    )
+}
+
 /// Creates a durable private backup without overwriting an existing destination.
 ///
-/// The source is copied into a fully synced `0o600` sibling temporary file. A
-/// same-directory hard link publishes that complete file at `backup_path`; the
-/// link operation fails atomically when the destination already exists. The
-/// temporary link is then removed and the containing directory is synced. A
-/// directory-sync failure is returned after publication without deleting the
-/// backup.
+/// The source is streamed into the same create-new publication path as
+/// [`create_new`] with mode `0o600`. The backup is fully synced before it
+/// becomes visible, an existing destination is never replaced, temporary
+/// cleanup after publication is best-effort, and the containing directory is
+/// synced before success is returned.
 pub fn nonclobber_backup(src: &Path, backup_path: &Path) -> io::Result<()> {
     let mut source = File::open(src)?;
-    let parent = containing_directory(backup_path)?;
-    fs::create_dir_all(parent)?;
-    let temp = stage_file(backup_path, Some(PRIVATE_MODE), |staged| {
-        io::copy(&mut source, staged).map(|_| ())
-    })?;
-
-    if let Err(error) = fs::hard_link(&temp, backup_path) {
-        let _ = fs::remove_file(&temp);
-        return Err(error);
-    }
-    fs::remove_file(&temp)?;
-    sync_directory(parent)
+    create_new_inner(
+        backup_path,
+        PRIVATE_MODE,
+        |staged| io::copy(&mut source, staged).map(|_| ()),
+        |temp| fs::remove_file(temp),
+        sync_directory,
+    )
 }
 
 /// An exclusive advisory lock held on an opened directory descriptor.
@@ -60,6 +76,21 @@ pub fn nonclobber_backup(src: &Path, backup_path: &Path) -> io::Result<()> {
 /// The directory itself is the lock object, so no deletable lock-file artifact
 /// can split concurrent users into separate lock domains. Dropping the guard
 /// closes its descriptor and releases the lock on every return or unwind path.
+///
+/// Discarding the guard immediately is rejected when unused values are denied:
+///
+/// ```compile_fail
+/// #![deny(unused_must_use)]
+/// use std::io;
+/// use std::path::Path;
+/// use crook::fs::DirectoryLock;
+///
+/// fn acquire_and_forget(dir: &Path) -> io::Result<()> {
+///     DirectoryLock::acquire(dir)?;
+///     Ok(())
+/// }
+/// ```
+#[must_use = "the directory stays locked only while this guard is alive"]
 #[derive(Debug)]
 pub struct DirectoryLock {
     _directory: File,
@@ -76,6 +107,43 @@ impl DirectoryLock {
             _directory: directory,
         })
     }
+}
+
+fn create_new_inner<W, R, S>(
+    path: &Path,
+    mode: u32,
+    write: W,
+    remove_temp: R,
+    sync_parent: S,
+) -> io::Result<()>
+where
+    W: FnOnce(&mut File) -> io::Result<()>,
+    R: FnMut(&Path) -> io::Result<()>,
+    S: FnOnce(&Path) -> io::Result<()>,
+{
+    let parent = containing_directory(path)?;
+    fs::create_dir_all(parent)?;
+    let temp = stage_file(path, Some(mode), write)?;
+    publish_new(&temp, path, parent, remove_temp, sync_parent)
+}
+
+fn publish_new<R, S>(
+    temp: &Path,
+    path: &Path,
+    parent: &Path,
+    mut remove_temp: R,
+    sync_parent: S,
+) -> io::Result<()>
+where
+    R: FnMut(&Path) -> io::Result<()>,
+    S: FnOnce(&Path) -> io::Result<()>,
+{
+    if let Err(error) = fs::hard_link(temp, path) {
+        let _ = remove_temp(temp);
+        return Err(error);
+    }
+    let _ = remove_temp(temp);
+    sync_parent(parent)
 }
 
 fn atomic_replace_inner<F>(
@@ -252,6 +320,27 @@ mod tests {
     }
 
     #[test]
+    fn create_new_publishes_bytes_mode_and_never_clobbers() {
+        let root = TestDir::new("create-new");
+        let path = root.path().join("nested/recovery.json");
+
+        create_new(&path, b"original", 0o640).expect("create recovery file");
+
+        assert_eq!(fs::read(&path).expect("read recovery file"), b"original");
+        let mode = fs::metadata(&path)
+            .expect("recovery metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640);
+
+        let error = create_new(&path, b"replacement", 0o600)
+            .expect_err("existing recovery file must not be replaced");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).expect("read unchanged file"), b"original");
+    }
+
+    #[test]
     fn containing_directory_is_synced_after_rename() {
         let root = TestDir::new("sync-order");
         let path = root.path().join("state.json");
@@ -327,6 +416,35 @@ mod tests {
                 .expect("read backup directory")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn published_create_new_survives_temporary_unlink_failure() {
+        let root = TestDir::new("unlink-failure");
+        let path = root.path().join("backup");
+        let temp = stage_file(&path, Some(0o600), |file| file.write_all(b"complete"))
+            .expect("stage backup");
+        let mut synced = false;
+
+        publish_new(
+            &temp,
+            &path,
+            root.path(),
+            |_| Err(io::Error::other("unlink refused")),
+            |directory| {
+                assert_eq!(directory, root.path());
+                synced = true;
+                sync_directory(directory)
+            },
+        )
+        .expect("published backup remains successful");
+
+        assert!(synced);
+        assert_eq!(fs::read(&path).expect("read published backup"), b"complete");
+        assert!(
+            temp.exists(),
+            "failed cleanup leaves only the temporary link"
         );
     }
 

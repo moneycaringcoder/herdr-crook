@@ -176,10 +176,7 @@ impl<'a> Records<'a> {
     pub fn get(self, index: usize) -> Option<Record<'a>> {
         self.values.get(index).map(|value| Record {
             value,
-            location: Location::Collection {
-                collection: self.collection,
-                index,
-            },
+            location: Location::new(self.collection, index),
         })
     }
 
@@ -191,7 +188,7 @@ impl<'a> Records<'a> {
             .enumerate()
             .map(move |(index, value)| Record {
                 value,
-                location: Location::Collection { collection, index },
+                location: Location::new(collection, index),
             })
     }
 }
@@ -200,7 +197,7 @@ impl<'a> Records<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct Record<'a> {
     value: &'a Value,
-    location: Location<'a>,
+    location: Location,
 }
 
 impl<'a> Record<'a> {
@@ -265,38 +262,24 @@ impl<'a> Record<'a> {
     }
 
     /// Returns an object field as a nested record view.
-    pub fn object<'b>(&'b self, field: &'b str) -> Option<Record<'b>>
-    where
-        'a: 'b,
-    {
+    pub fn object(self, field: &'static str) -> Option<Record<'a>> {
         let value = self.value.get(field).filter(|value| value.is_object())?;
-        Some(Record {
-            value,
-            location: Location::Field {
-                parent: &self.location,
-                field,
-            },
-        })
+        let location = self.location.nested(field)?;
+        Some(Record { value, location })
     }
 
     /// Requires an object field and returns it as a nested record view.
-    pub fn require_object<'b>(&'b self, field: &'b str) -> Result<Record<'b>, SnapshotError>
-    where
-        'a: 'b,
-    {
+    pub fn require_object(self, field: &'static str) -> Result<Record<'a>, SnapshotError> {
         self.require_record()?;
         self.object(field)
             .ok_or_else(|| self.field_error(field, "an object"))
     }
 
     /// Accepts an absent, null, or object field and rejects every other type.
-    pub fn require_object_or_null<'b>(
-        &'b self,
-        field: &'b str,
-    ) -> Result<Option<Record<'b>>, SnapshotError>
-    where
-        'a: 'b,
-    {
+    pub fn require_object_or_null(
+        self,
+        field: &'static str,
+    ) -> Result<Option<Record<'a>>, SnapshotError> {
         self.require_record()?;
         match self.value.get(field) {
             None | Some(Value::Null) => Ok(None),
@@ -329,12 +312,16 @@ impl<'a> Record<'a> {
             .ok_or_else(|| self.field_error(field, "an unsigned integer"))
     }
 
-    /// Returns a non-blank text field as a borrowed path without normalization.
+    /// Returns a text field as a borrowed path after trimming surrounding
+    /// whitespace, treating blank text as absent. No other normalization is
+    /// performed: the path is not canonicalized, `.` components are retained,
+    /// and tilde expansion is not applied.
     pub fn path(self, field: &str) -> Option<&'a Path> {
         self.nonempty_text(field).map(Path::new)
     }
 
-    /// Requires a non-blank text field and returns it as a borrowed path.
+    /// Requires a non-blank text field, trims surrounding whitespace, and
+    /// returns it as a borrowed path without any other normalization.
     pub fn require_path(self, field: &str) -> Result<&'a Path, SnapshotError> {
         self.require_nonempty_text(field).map(Path::new)
     }
@@ -354,38 +341,44 @@ impl<'a> Record<'a> {
     }
 }
 
+const MAX_OBJECT_DEPTH: usize = 2;
+
 #[derive(Debug, Clone, Copy)]
-enum Location<'a> {
-    Collection {
-        collection: &'static str,
-        index: usize,
-    },
-    Field {
-        parent: &'a Location<'a>,
-        field: &'a str,
-    },
+struct Location {
+    collection: &'static str,
+    index: usize,
+    fields: [&'static str; MAX_OBJECT_DEPTH],
+    depth: u8,
 }
 
-impl Location<'_> {
-    fn path(&self) -> String {
-        let mut path = String::new();
-        self.push_path(&mut path);
-        path
+impl Location {
+    fn new(collection: &'static str, index: usize) -> Self {
+        Self {
+            collection,
+            index,
+            fields: [""; MAX_OBJECT_DEPTH],
+            depth: 0,
+        }
     }
 
-    fn push_path(&self, path: &mut String) {
-        match self {
-            Self::Collection { collection, index } => {
-                use fmt::Write as _;
-                write!(path, "session.snapshot.{collection}[{index}]")
-                    .expect("writing to a String cannot fail");
-            }
-            Self::Field { parent, field } => {
-                parent.push_path(path);
-                path.push('.');
-                path.push_str(field);
-            }
+    fn nested(mut self, field: &'static str) -> Option<Self> {
+        let slot = self.fields.get_mut(usize::from(self.depth))?;
+        *slot = field;
+        self.depth += 1;
+        Some(self)
+    }
+
+    fn path(self) -> String {
+        use fmt::Write as _;
+
+        let mut path = String::new();
+        write!(path, "session.snapshot.{}[{}]", self.collection, self.index)
+            .expect("writing to a String cannot fail");
+        for field in &self.fields[..usize::from(self.depth)] {
+            path.push('.');
+            path.push_str(field);
         }
+        path
     }
 }
 
@@ -508,6 +501,24 @@ mod tests {
         assert_eq!(pane.text("cwd"), Some("   "));
         assert_eq!(pane.nonempty_text("cwd"), None);
         assert!(pane.require_path("cwd").is_err());
+    }
+
+    #[test]
+    fn nested_object_path_can_outlive_a_temporary_parent_record() {
+        fn checkout_path(snapshot: &Snapshot) -> Result<&Path, SnapshotError> {
+            snapshot
+                .workspace("w1")
+                .expect("workspace")
+                .require_object("worktree")?
+                .require_path("checkout_path")
+        }
+
+        let snapshot = Snapshot::from_result(valid_result()).expect("valid snapshot");
+
+        assert_eq!(
+            checkout_path(&snapshot).expect("checkout path"),
+            Path::new("/repo/./alpha")
+        );
     }
 
     #[test]
