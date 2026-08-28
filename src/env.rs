@@ -202,7 +202,8 @@ impl PluginEnv {
     }
 
     /// The absolute root directory of the installed plugin, when supplied by
-    /// Herdr.
+    /// Herdr. Installed plugin commands run from this directory, so it is not an
+    /// invocation-repository fallback.
     pub fn plugin_root(&self) -> Option<&Path> {
         self.plugin_root.as_deref()
     }
