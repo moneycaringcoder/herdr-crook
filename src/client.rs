@@ -16,8 +16,6 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
-#[cfg(unix)]
-const MIN_SOCKET_TIMEOUT: Duration = Duration::from_micros(1);
 const RETRY_BACKOFF: Duration = Duration::from_millis(150);
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -233,37 +231,44 @@ fn dial(socket_path: &Path) -> io::Result<UnixStream> {
 
 #[cfg(unix)]
 fn set_read_timeout(stream: &UnixStream, socket_path: &Path, timeout: Duration) -> io::Result<()> {
-    stream
-        .set_read_timeout(Some(normalize_socket_timeout(timeout)))
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "cannot set read timeout for {}: {error}",
-                    socket_path.display()
-                ),
-            )
-        })
+    stream.set_read_timeout(Some(timeout)).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot set read timeout for {}: {error}",
+                socket_path.display()
+            ),
+        )
+    })
 }
 
 #[cfg(unix)]
 fn set_write_timeout(stream: &UnixStream, socket_path: &Path, timeout: Duration) -> io::Result<()> {
-    stream
-        .set_write_timeout(Some(normalize_socket_timeout(timeout)))
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "cannot set write timeout for {}: {error}",
-                    socket_path.display()
-                ),
-            )
-        })
+    stream.set_write_timeout(Some(timeout)).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot set write timeout for {}: {error}",
+                socket_path.display()
+            ),
+        )
+    })
 }
 
 #[cfg(unix)]
-fn normalize_socket_timeout(timeout: Duration) -> Duration {
-    timeout.max(MIN_SOCKET_TIMEOUT)
+fn refresh_read_timeout(
+    stream: &UnixStream,
+    socket_path: &Path,
+    timeout: Duration,
+) -> Result<(), Error> {
+    match set_read_timeout(stream, socket_path, timeout) {
+        Ok(()) => Ok(()),
+        // Darwin can reject SO_RCVTIMEO after the peer closes even while the
+        // receive buffer still contains data. The existing timeout remains,
+        // and the next read will drain buffered bytes or observe EOF.
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(error) => Err(Error::transport(error)),
+    }
 }
 
 #[cfg(unix)]
@@ -396,7 +401,7 @@ fn read_response_line_with_timeout(
 
     loop {
         let remaining = remaining_timeout(deadline, "read from", socket_path, timeout)?;
-        set_read_timeout(stream, socket_path, remaining).map_err(Error::transport)?;
+        refresh_read_timeout(stream, socket_path, remaining)?;
         let read = match stream.read(&mut chunk) {
             Ok(read) => read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -1018,20 +1023,6 @@ mod tests {
                 Error::Transport(source) if source.kind() == kind
             ));
         }
-    }
-
-    #[test]
-    fn submicrosecond_socket_timeouts_are_rounded_up() {
-        assert_eq!(
-            normalize_socket_timeout(Duration::from_nanos(1)),
-            MIN_SOCKET_TIMEOUT
-        );
-
-        let (stream, _peer) = UnixStream::pair().expect("create socket pair");
-        set_read_timeout(&stream, Path::new("socketpair"), Duration::from_nanos(1))
-            .expect("set minimum read timeout");
-        set_write_timeout(&stream, Path::new("socketpair"), Duration::from_nanos(1))
-            .expect("set minimum write timeout");
     }
 
     #[test]
