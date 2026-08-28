@@ -5,3 +5,7 @@
 
 pub mod client;
 pub mod env;
+#[cfg(unix)]
+pub mod fs;
+pub mod rpc;
+pub mod snapshot;

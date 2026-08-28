@@ -1,11 +1,12 @@
 # crook
 
-Crook is a Rust library for Herdr plugin authors. It provides a bounded client
-for Herdr's Unix-socket API and resolves the environment variables Herdr passes
-to plugins.
+Crook is a Rust library for Herdr plugin authors. It provides a bounded
+Unix-socket client, validated snapshot views, wrappers for the four common
+Herdr RPCs, durable Unix file primitives, and plugin environment resolution.
 
-Crook returns raw `serde_json::Value` results. Plugins remain responsible for
-their RPC-specific types, validation, and behavior.
+The lower-level client returns raw `serde_json::Value` results. Snapshot and RPC
+helpers validate only shared wire structure; plugins retain their domain types,
+reducers, state machines, rendering, and policy.
 
 ## Requirements
 
@@ -23,8 +24,8 @@ crook = { git = "https://github.com/moneycaringcoder/herdr-crook", tag = "v0.2.0
 serde_json = "1"
 ```
 
-Crook has no feature flags. Its only non-standard-library dependency is
-`serde_json`.
+Crook has no feature flags. It depends on `serde_json` and, on Unix targets,
+`libc` for advisory directory locks.
 
 ## Quick start
 
@@ -99,6 +100,30 @@ retried. A retry reuses the original request ID.
 
 Use `Error::protocol_code()` when callers need Herdr's stable error code.
 
+## Snapshot views
+
+`Snapshot::from_result` validates the `session_snapshot` result type, nested
+`snapshot` object, and its `workspaces`, `panes`, and `agents` arrays. Borrowed
+record views provide lenient field access, strict field checks with indexed JSON
+paths, path access, and ordered workspace/pane/agent ID joins. They do not parse
+plugin domain state or normalize paths.
+
+## Common RPCs
+
+`crook::rpc` wraps only `session.snapshot`, `notification.show`,
+`workspace.report_metadata`, and `worktree.list`. The wrappers build the request
+shapes used by Herdr plugins, select the established retry safety, preserve
+protocol error codes, enforce metadata merge-patch and TTL rules, and leave
+plugin-specific worktree reduction to callers.
+
+## Durable files
+
+On Unix, `crook::fs` provides atomic replacement with file and containing
+directory sync, an explicit-mode variant for private files, durable
+non-clobbering `0o600` backups, and a directory-scoped RAII `flock` guard. A
+directory-sync error after publication is returned without rolling back the
+already-published file.
+
 ## Plugin environment
 
 ```rust
@@ -147,18 +172,21 @@ Blank environment values are treated as unset.
 
 ## Scope
 
-Crook v0.2 provides:
+Crook provides:
 
 - bounded request/response transport for the Herdr Unix socket;
 - request ID and response-envelope validation;
 - explicit retry safety;
+- structural `session.snapshot` validation and ID joins;
+- thin wrappers for the four RPCs shared across Herdr plugins;
+- Unix atomic replacement, non-clobbering backup, and directory-lock primitives;
 - plugin ID, socket, state-directory, config-directory, installed-root, and
   invocation-context resolution.
 
-Crook v0.2 does not provide:
+Crook does not provide:
 
-- typed wrappers for individual Herdr RPCs;
-- snapshot reducers or plugin domain types;
-- plugin state machines, rendering, or policy;
+- plugin domain types, reducers, state machines, rendering, storage schemas, or
+  policy;
+- wrappers for RPCs outside the four common methods;
 - persistent connections or event subscriptions;
 - configurable timeout or response-size policies.

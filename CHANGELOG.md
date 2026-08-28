@@ -4,6 +4,12 @@ All notable changes to Crook are recorded here. Crook follows [Semantic Versioni
 
 ## [Unreleased]
 
+### Added
+
+- Validated structural views and ID joins for `session.snapshot` results.
+- Thin wrappers for the four RPCs shared across Herdr plugins.
+- Unix atomic replacement, non-clobbering backup, and directory-lock primitives.
+
 ## [0.2.0] - 2026-08-28
 
 ### Added
