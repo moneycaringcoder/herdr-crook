@@ -9,3 +9,5 @@ pub mod env;
 pub mod fs;
 pub mod rpc;
 pub mod snapshot;
+#[cfg(all(feature = "test-support", unix))]
+pub mod test_support;
