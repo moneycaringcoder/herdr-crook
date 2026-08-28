@@ -47,10 +47,11 @@ fn load_snapshot() -> Result<serde_json::Value, crook::client::Error> {
 ```
 
 `Client::connect` performs a preflight connection probe and retries it once
-after 150 ms on a transport failure. The successful probe connection is
-discarded. `Client::new` constructs the same client without opening the socket.
-The operating system's blocking connect call is outside the read and write
-deadlines.
+after 150 ms on a potentially transient transport failure. Interrupted,
+invalid-input, and unsupported failures return immediately. The successful
+probe connection is discarded. `Client::new` constructs the same client
+without opening the socket. The operating system's blocking connect call is
+outside the read and write deadlines.
 
 ## Testing your plugin
 

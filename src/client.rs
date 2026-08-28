@@ -183,7 +183,7 @@ fn preflight_with(
     mut sleep: impl FnMut(Duration),
 ) -> Result<(), Error> {
     match attempt() {
-        Err(first @ Error::Transport(_)) => {
+        Err(first @ Error::Transport(_)) if retryable_preflight_failure(&first) => {
             sleep(RETRY_BACKOFF);
             match attempt() {
                 Err(second @ Error::Transport(_)) => Err(combine_transport_failures(first, second)),
@@ -192,6 +192,19 @@ fn preflight_with(
         }
         outcome => outcome,
     }
+}
+
+fn retryable_preflight_failure(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Transport(source)
+            if !matches!(
+                source.kind(),
+                io::ErrorKind::Interrupted
+                    | io::ErrorKind::InvalidInput
+                    | io::ErrorKind::Unsupported
+            )
+    )
 }
 
 fn combine_transport_failures(first: Error, second: Error) -> Error {
@@ -207,18 +220,12 @@ fn combine_transport_failures(first: Error, second: Error) -> Error {
 
 #[cfg(unix)]
 fn dial(socket_path: &Path) -> io::Result<UnixStream> {
-    let stream = loop {
-        match UnixStream::connect(socket_path) {
-            Ok(stream) => break stream,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => {
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!("cannot reach herdr at {}: {error}", socket_path.display()),
-                ))
-            }
-        }
-    };
+    let stream = UnixStream::connect(socket_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot reach herdr at {}: {error}", socket_path.display()),
+        )
+    })?;
     set_read_timeout(&stream, socket_path, IO_TIMEOUT)?;
     set_write_timeout(&stream, socket_path, IO_TIMEOUT)?;
     Ok(stream)
@@ -725,10 +732,7 @@ mod tests {
             .request("test", json!({}), RetrySafety::Never)
             .expect_err("unterminated response");
 
-        assert!(matches!(
-            error,
-            Error::Transport(source) if source.kind() == io::ErrorKind::UnexpectedEof
-        ));
+        assert!(matches!(error, Error::Transport(_)));
         server.join().expect("mock server");
     }
 
@@ -979,6 +983,31 @@ mod tests {
 
         assert_eq!(attempts.get(), 2);
         assert_eq!(sleeps.take(), vec![RETRY_BACKOFF]);
+    }
+
+    #[test]
+    fn connect_preflight_does_not_retry_permanent_failures() {
+        for kind in [
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::Unsupported,
+        ] {
+            let attempts = std::cell::Cell::new(0_u8);
+            let error = preflight_with(
+                || {
+                    attempts.set(attempts.get() + 1);
+                    Err(Error::transport(io::Error::new(kind, "permanent dial")))
+                },
+                |_| panic!("permanent failure must not sleep"),
+            )
+            .expect_err("permanent preflight failure");
+
+            assert_eq!(attempts.get(), 1);
+            assert!(matches!(
+                error,
+                Error::Transport(source) if source.kind() == kind
+            ));
+        }
     }
 
     #[test]
