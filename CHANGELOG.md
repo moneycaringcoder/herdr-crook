@@ -4,7 +4,7 @@ All notable changes to Crook are recorded here. Crook follows [Semantic Versioni
 
 ## [Unreleased]
 
-## [0.1.1] - 2026-08-28
+## [0.2.0] - 2026-08-28
 
 ### Added
 
@@ -23,6 +23,6 @@ All notable changes to Crook are recorded here. Crook follows [Semantic Versioni
 
 [Semantic Versioning]: https://semver.org/
 
-[Unreleased]: https://github.com/moneycaringcoder/herdr-crook/compare/v0.1.1...HEAD
-[0.1.1]: https://github.com/moneycaringcoder/herdr-crook/compare/v0.1.0...v0.1.1
+[Unreleased]: https://github.com/moneycaringcoder/herdr-crook/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/moneycaringcoder/herdr-crook/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/moneycaringcoder/herdr-crook/releases/tag/v0.1.0

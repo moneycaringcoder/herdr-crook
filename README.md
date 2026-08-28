@@ -19,7 +19,7 @@ Pin a released tag and commit `Cargo.lock`:
 
 ```toml
 [dependencies]
-crook = { git = "https://github.com/moneycaringcoder/herdr-crook", tag = "v0.1.0" }
+crook = { git = "https://github.com/moneycaringcoder/herdr-crook", tag = "v0.2.0" }
 serde_json = "1"
 ```
 
