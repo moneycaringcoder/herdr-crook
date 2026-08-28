@@ -47,11 +47,11 @@ fn load_snapshot() -> Result<serde_json::Value, crook::client::Error> {
 ```
 
 `Client::connect` performs a preflight connection probe and retries it once
-after 150 ms on a potentially transient transport failure. Interrupted,
-invalid-input, and unsupported failures return immediately. The successful
-probe connection is discarded. `Client::new` constructs the same client
-without opening the socket. The operating system's blocking connect call is
-outside the read and write deadlines.
+after 150 ms on a potentially transient transport failure. Invalid-input and
+unsupported failures return immediately. The successful probe connection is
+discarded. `Client::new` constructs the same client without opening the socket.
+The operating system's blocking connect call is outside the read and write
+deadlines.
 
 ## Testing your plugin
 
@@ -107,6 +107,7 @@ Request parameters must be a JSON object. Crook:
 - assigns string IDs using the prefix supplied to `Client`;
 - enforces separate 15-second total budgets for the write and response-read
   phases;
+- requires the response line to end with a newline;
 - rejects response lines larger than 4 MiB;
 - requires the response ID to match the request ID;
 - requires exactly one of `result` or `error`;
@@ -124,7 +125,9 @@ Choose retry behavior for every request:
 Protocol errors, invalid response contracts, and oversized responses are never
 retried. A retry reuses the original request ID. A transport failure can happen
 after Herdr received part or all of the first request, so select `Idempotent`
-only when repeating the operation is safe.
+only when repeating the operation is safe. EOF before the response newline is a
+transport failure and follows that retry policy even when the preceding bytes
+form complete JSON.
 
 ## Errors
 

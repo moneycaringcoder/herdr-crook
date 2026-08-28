@@ -198,9 +198,7 @@ fn retryable_preflight_failure(error: &Error) -> bool {
         Error::Transport(source)
             if !matches!(
                 source.kind(),
-                io::ErrorKind::Interrupted
-                    | io::ErrorKind::InvalidInput
-                    | io::ErrorKind::Unsupported
+                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
             )
     )
 }
@@ -263,9 +261,25 @@ fn refresh_read_timeout(
 ) -> Result<(), Error> {
     match set_read_timeout(stream, socket_path, timeout) {
         Ok(()) => Ok(()),
-        // Darwin can reject SO_RCVTIMEO after the peer closes even while the
-        // receive buffer still contains data. The existing timeout remains,
-        // and the next read will drain buffered bytes or observe EOF.
+        // Darwin can reject SO_RCVTIMEO after peer close while bytes remain
+        // buffered. The prior timeout may outlive the remaining total budget
+        // for another EINVAL cause, so keep this tolerance Apple-only.
+        #[cfg(target_vendor = "apple")]
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(error) => Err(Error::transport(error)),
+    }
+}
+
+#[cfg(unix)]
+fn refresh_write_timeout(
+    stream: &UnixStream,
+    socket_path: &Path,
+    timeout: Duration,
+) -> Result<(), Error> {
+    match set_write_timeout(stream, socket_path, timeout) {
+        Ok(()) => Ok(()),
+        // Darwin reports EINVAL after peer close; let write expose BrokenPipe.
+        #[cfg(target_vendor = "apple")]
         Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
         Err(error) => Err(Error::transport(error)),
     }
@@ -307,7 +321,7 @@ fn write_request(
     let deadline = Instant::now() + timeout;
     while !encoded.is_empty() {
         let remaining = remaining_timeout(deadline, "write to", socket_path, timeout)?;
-        set_write_timeout(stream, socket_path, remaining).map_err(Error::transport)?;
+        refresh_write_timeout(stream, socket_path, remaining)?;
         match stream.write(encoded) {
             Ok(0) => {
                 return Err(Error::transport(io::Error::new(
@@ -334,28 +348,12 @@ fn write_request(
         }
     }
 
-    loop {
-        let remaining = remaining_timeout(deadline, "write to", socket_path, timeout)?;
-        set_write_timeout(stream, socket_path, remaining).map_err(Error::transport)?;
-        match stream.flush() {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) =>
-            {
-                return Err(deadline_error("write to", socket_path, timeout))
-            }
-            Err(error) => {
-                return Err(Error::transport(io::Error::new(
-                    error.kind(),
-                    format!("flush to {} failed: {error}", socket_path.display()),
-                )))
-            }
-        }
-    }
+    stream.flush().map_err(|error| {
+        Error::transport(io::Error::new(
+            error.kind(),
+            format!("flush to {} failed: {error}", socket_path.display()),
+        ))
+    })
 }
 
 #[cfg(not(unix))]
@@ -527,6 +525,7 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard};
     use std::thread::{self, JoinHandle};
     use std::time::Instant;
 
@@ -534,6 +533,61 @@ mod tests {
 
     static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
     const MOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+    static SIGNAL_LOCK: Mutex<()> = Mutex::new(());
+
+    extern "C" fn noop_signal_handler(_: libc::c_int) {}
+
+    struct SignalGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous: libc::sigaction,
+    }
+
+    impl SignalGuard {
+        fn install() -> Self {
+            let lock = SIGNAL_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // SAFETY: sigaction is a plain C struct and every field is filled
+            // before it is passed to libc.
+            let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+            action.sa_sigaction = noop_signal_handler as *const () as usize;
+            action.sa_flags = 0;
+            // SAFETY: action.sa_mask points to initialized writable storage.
+            assert_eq!(unsafe { libc::sigemptyset(&mut action.sa_mask) }, 0);
+            // SAFETY: previous points to valid writable storage and action
+            // remains alive for the duration of the call.
+            let mut previous = unsafe { std::mem::zeroed::<libc::sigaction>() };
+            assert_eq!(
+                unsafe { libc::sigaction(libc::SIGUSR2, &action, &mut previous) },
+                0
+            );
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for SignalGuard {
+        fn drop(&mut self) {
+            // SAFETY: previous came from sigaction and remains initialized.
+            let _ = unsafe { libc::sigaction(libc::SIGUSR2, &self.previous, std::ptr::null_mut()) };
+        }
+    }
+
+    fn current_thread_id() -> usize {
+        // SAFETY: pthread_self has no preconditions.
+        unsafe { libc::pthread_self() as usize }
+    }
+
+    fn interrupt_thread(thread: usize) {
+        // SAFETY: thread is captured from pthread_self while that thread lives.
+        assert_eq!(
+            unsafe { libc::pthread_kill(thread as libc::pthread_t, libc::SIGUSR2) },
+            0
+        );
+    }
 
     struct TestSocket {
         path: PathBuf,
@@ -790,6 +844,59 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_read_continues_to_the_response() {
+        let _signal = SignalGuard::install();
+        let target = current_thread_id();
+        let (mut reader, mut writer) = UnixStream::pair().expect("create socket pair");
+        let responder = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            interrupt_thread(target);
+            thread::sleep(Duration::from_millis(50));
+            writer
+                .write_all(b"response\n")
+                .expect("write response after interrupt");
+        });
+
+        let response = read_response_line_with_timeout(
+            &mut reader,
+            Path::new("socketpair"),
+            Duration::from_secs(1),
+        )
+        .expect("read must resume after EINTR");
+
+        assert_eq!(response, b"response");
+        responder.join().expect("interrupting responder");
+    }
+
+    #[test]
+    fn interrupted_blocked_write_respects_total_deadline() {
+        let _signal = SignalGuard::install();
+        let target = current_thread_id();
+        let (mut writer, _reader) = UnixStream::pair().expect("create socket pair");
+        let interrupter = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            interrupt_thread(target);
+        });
+        let timeout = Duration::from_millis(200);
+        let payload = vec![0_u8; 8 * 1024 * 1024];
+        let started = Instant::now();
+
+        let error = write_request(&mut writer, Path::new("socketpair"), &payload, timeout)
+            .expect_err("blocked write must time out");
+        let elapsed = started.elapsed();
+        interrupter.join().expect("write interrupter");
+
+        assert!(matches!(
+            error,
+            Error::Transport(source) if source.kind() == io::ErrorKind::TimedOut
+        ));
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "blocked write extended the deadline to {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn non_object_params_are_rejected_before_dial_or_id_allocation() {
         let (socket, server) = spawn_server(|listener| {
             let mut stream = accept(&listener);
@@ -1001,12 +1108,37 @@ mod tests {
     }
 
     #[test]
+    fn connect_preflight_retries_interrupted_failure() {
+        let attempts = std::cell::Cell::new(0_u8);
+        let sleeps = std::cell::Cell::new(Vec::new());
+
+        preflight_with(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(Error::transport(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "interrupted dial",
+                    )))
+                } else {
+                    Ok(())
+                }
+            },
+            |duration| {
+                let mut recorded = sleeps.take();
+                recorded.push(duration);
+                sleeps.set(recorded);
+            },
+        )
+        .expect("interrupted preflight retry succeeds");
+
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(sleeps.take(), vec![RETRY_BACKOFF]);
+    }
+
+    #[test]
     fn connect_preflight_does_not_retry_permanent_failures() {
-        for kind in [
-            io::ErrorKind::Interrupted,
-            io::ErrorKind::InvalidInput,
-            io::ErrorKind::Unsupported,
-        ] {
+        for kind in [io::ErrorKind::InvalidInput, io::ErrorKind::Unsupported] {
             let attempts = std::cell::Cell::new(0_u8);
             let error = preflight_with(
                 || {
