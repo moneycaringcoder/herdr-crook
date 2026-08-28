@@ -848,8 +848,18 @@ mod tests {
             }))
             .expect("encode oversized response");
             assert_eq!(response.len(), MAX_RESPONSE_BYTES + 1);
-            let _ = stream.write_all(&response);
-            let _ = stream.write_all(b"\n");
+            stream
+                .write_all(&response)
+                .expect("write oversized response");
+            stream
+                .set_read_timeout(Some(MOCK_TIMEOUT))
+                .expect("bound close wait");
+            let mut closed = [0_u8; 1];
+            assert_eq!(
+                stream.read(&mut closed).expect("await client close"),
+                0,
+                "client must close after rejecting the oversized line"
+            );
         });
         let client = Client::new(&socket.path, "over");
 
