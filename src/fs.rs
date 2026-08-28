@@ -11,6 +11,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const PRIVATE_MODE: u32 = 0o600;
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
+struct TemporaryPath(Option<PathBuf>);
+
+impl TemporaryPath {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn keep(mut self) -> PathBuf {
+        self.0.take().expect("temporary path is present")
+    }
+}
+
+impl Drop for TemporaryPath {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 /// Atomically replaces `path` with `bytes` using default file permissions.
 ///
 /// The replacement does not inherit the mode of an existing target: its mode is
@@ -20,29 +40,34 @@ static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 /// The parent directory is created when necessary. Bytes are written to a
 /// unique sibling temporary file and `sync_all` is called before rename. After
 /// rename, the containing directory is synced so the new directory entry is
-/// durable. If that final directory sync fails, the replacement has already
-/// happened and remains in place; the error reports that durability is unknown.
+/// durable. Newly created parent directories are not separately synced into
+/// their ancestors. If the final directory sync fails, the replacement has
+/// already happened and remains in place; the error reports that durability is
+/// unknown.
 pub fn atomic_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     atomic_replace_inner(path, bytes, None, sync_directory)
 }
 
 /// Atomically replaces `path` with `bytes` using an exact Unix permission mode.
 ///
-/// The temporary file is created with `mode` before any bytes are written, then
-/// explicitly set to that mode to counter a restrictive process umask. File and
-/// containing-directory durability semantics are identical to [`atomic_replace`].
+/// The temporary file remains private while bytes are written, then is set to
+/// `mode` before it is synced and published.
+/// File and containing-directory durability semantics are identical to
+/// [`atomic_replace`].
 pub fn atomic_replace_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     atomic_replace_inner(path, bytes, Some(mode), sync_directory)
 }
 
 /// Creates a durable file without overwriting an existing destination.
 ///
-/// Bytes are written and synced in a sibling temporary file created with the
-/// exact Unix `mode`. A same-directory hard link publishes that complete file
+/// Bytes are written to a private sibling temporary file, which is then set to
+/// the exact Unix `mode` and synced. A same-directory hard link publishes it
 /// at `path`; publication fails atomically with [`io::ErrorKind::AlreadyExists`]
 /// when the destination exists. Temporary cleanup is best-effort after
 /// publication, then the containing directory is synced. A directory-sync
 /// failure is returned after publication without deleting the new file.
+/// Newly created parent directories are not separately synced into their
+/// ancestors.
 pub fn create_new(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     create_new_inner(
         path,
@@ -60,6 +85,8 @@ pub fn create_new(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
 /// becomes visible, an existing destination is never replaced, temporary
 /// cleanup after publication is best-effort, and the containing directory is
 /// synced before success is returned.
+/// Newly created parent directories are not separately synced into their
+/// ancestors.
 pub fn nonclobber_backup(src: &Path, backup_path: &Path) -> io::Result<()> {
     let mut source = File::open(src)?;
     create_new_inner(
@@ -173,26 +200,22 @@ where
     let parent = containing_directory(path)?;
     let (temp, mut file) = create_sibling_temp(path, parent, mode)?;
     let result = (|| {
+        write(&mut file)?;
         if let Some(mode) = mode {
             file.set_permissions(fs::Permissions::from_mode(mode))?;
         }
-        write(&mut file)?;
         file.sync_all()
     })();
     drop(file);
-
-    if let Err(error) = result {
-        let _ = fs::remove_file(&temp);
-        return Err(error);
-    }
-    Ok(temp)
+    result?;
+    Ok(temp.keep())
 }
 
 fn create_sibling_temp(
     path: &Path,
     parent: &Path,
     mode: Option<u32>,
-) -> io::Result<(PathBuf, File)> {
+) -> io::Result<(TemporaryPath, File)> {
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -209,11 +232,11 @@ fn create_sibling_temp(
 
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        if let Some(mode) = mode {
-            options.mode(mode);
+        if mode.is_some() {
+            options.mode(PRIVATE_MODE);
         }
         match options.open(&temp) {
-            Ok(file) => return Ok((temp, file)),
+            Ok(file) => return Ok((TemporaryPath::new(temp), file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
@@ -317,6 +340,54 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn explicit_mode_is_applied_only_after_staging_is_complete() {
+        let root = TestDir::new("staging-mode");
+        let path = root.path().join("state.json");
+        let requested_mode = 0o4750;
+
+        let temp = stage_file(&path, Some(requested_mode), |file| {
+            let mode_while_writing = file
+                .metadata()
+                .expect("temporary metadata")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode_while_writing & 0o077, 0);
+            assert_ne!(mode_while_writing, requested_mode);
+            file.write_all(b"complete")
+        })
+        .expect("stage file");
+
+        let staged_mode = fs::metadata(&temp)
+            .expect("staged metadata")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(staged_mode, requested_mode);
+        fs::remove_file(temp).expect("remove staged file");
+    }
+
+    #[test]
+    fn staging_panic_removes_temporary_file() {
+        let root = TestDir::new("staging-panic");
+        let path = root.path().join("state.json");
+
+        let panic = std::panic::catch_unwind(|| {
+            let _ = stage_file(&path, Some(PRIVATE_MODE), |_| -> io::Result<()> {
+                panic!("injected staging panic");
+            });
+        });
+
+        assert!(panic.is_err());
+        assert_eq!(
+            fs::read_dir(root.path())
+                .expect("read test directory")
+                .count(),
+            0
+        );
     }
 
     #[test]

@@ -345,6 +345,11 @@ fn bind_listener() -> Result<(PathBuf, PathBuf, UnixListener), Error> {
     }
 }
 
+fn install_stream_timeouts(stream: &UnixStream, timeout: Duration) -> io::Result<()> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))
+}
+
 fn serve(
     listener: UnixListener,
     mut replies: VecDeque<FixtureReply>,
@@ -354,8 +359,9 @@ fn serve(
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let _ = stream.set_read_timeout(Some(STREAM_POLL));
-                let _ = stream.set_write_timeout(Some(STREAM_POLL));
+                if install_stream_timeouts(&stream, STREAM_POLL).is_err() {
+                    continue;
+                }
                 let Ok(Some(raw)) = read_request(&mut stream, &stop) else {
                     continue;
                 };
@@ -596,5 +602,42 @@ mod tests {
 
         assert_eq!(writer.written, b"y");
         assert!(writer.steps.is_empty());
+    }
+
+    #[test]
+    fn stream_timeout_installation_reports_failure() {
+        let (stream, _peer) = UnixStream::pair().expect("create socket pair");
+
+        let error = install_stream_timeouts(&stream, Duration::ZERO)
+            .expect_err("zero timeout must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn panic_with_live_server_restores_environment_and_poison_is_recoverable() {
+        const NAME: &str = "CROOK_TEST_SUPPORT_PANIC_RESTORE";
+        let original = env::var_os(NAME);
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        let panicking_test = thread::spawn(move || {
+            let mut environment = EnvGuard::new();
+            environment.set(NAME, "temporary");
+            let server = FixtureServer::new([]).expect("start fixture server");
+            sender
+                .send(server.socket_path().to_owned())
+                .expect("share live server path");
+            panic!("simulate a panicking test");
+        });
+
+        let socket_path = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("panicking test started its server");
+        assert!(panicking_test.join().is_err());
+        assert!(!socket_path.exists());
+        assert_eq!(env::var_os(NAME), original);
+
+        let recovered = EnvGuard::new();
+        drop(recovered);
     }
 }
