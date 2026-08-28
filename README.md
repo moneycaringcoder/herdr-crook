@@ -19,7 +19,7 @@ Pin a released tag and commit `Cargo.lock`:
 
 ```toml
 [dependencies]
-crook = { git = "https://github.com/moneycaringcoder/herdr-crook", tag = "v0.1.0" }
+crook = { git = "https://github.com/moneycaringcoder/herdr-crook", tag = "v0.2.0" }
 serde_json = "1"
 ```
 
@@ -147,7 +147,7 @@ Blank environment values are treated as unset.
 
 ## Scope
 
-Crook v0.1 provides:
+Crook v0.2 provides:
 
 - bounded request/response transport for the Herdr Unix socket;
 - request ID and response-envelope validation;
@@ -155,7 +155,7 @@ Crook v0.1 provides:
 - plugin ID, socket, state-directory, config-directory, installed-root, and
   invocation-context resolution.
 
-Crook v0.1 does not provide:
+Crook v0.2 does not provide:
 
 - typed wrappers for individual Herdr RPCs;
 - snapshot reducers or plugin domain types;
