@@ -102,7 +102,7 @@ Use `Error::protocol_code()` when callers need Herdr's stable error code.
 ## Plugin environment
 
 ```rust
-use crook::env::PluginEnv;
+use crook::env::{PluginContext, PluginEnv};
 
 let env = PluginEnv::resolve("example.plugin");
 
@@ -110,11 +110,17 @@ println!("plugin: {}", env.plugin_id());
 println!("socket: {}", env.socket_path().display());
 println!("state: {}", env.state_dir().display());
 println!("config: {}", env.config_dir().display());
+
+if let Some(context) = PluginContext::resolve()? {
+    let invocation_cwd = context
+        .focused_pane_cwd()
+        .or_else(|| context.workspace_cwd());
+}
 ```
 
 A non-blank UTF-8 `HERDR_PLUGIN_ID` takes precedence over the supplied default.
-Non-blank injected path variables take precedence and are preserved unchanged,
-including relative and non-UTF-8 paths.
+Non-blank socket, state, and config path variables take precedence and are
+preserved unchanged, including relative and non-UTF-8 paths.
 
 | Value | Herdr variable | Fallback |
 | --- | --- | --- |
@@ -122,11 +128,20 @@ including relative and non-UTF-8 paths.
 | Socket | `HERDR_SOCKET_PATH` | `<config-base>/herdr/herdr.sock` |
 | State directory | `HERDR_PLUGIN_STATE_DIR` | `<state-base>/herdr/plugins/<plugin-id>` |
 | Config directory | `HERDR_PLUGIN_CONFIG_DIR` | `<config-base>/herdr/plugins/config/<plugin-id>` |
+| Invocation context | `HERDR_PLUGIN_CONTEXT_JSON` | No context |
+| Installed plugin root | `HERDR_PLUGIN_ROOT` | No plugin root |
 
 Each base is resolved independently. `config-base` uses an absolute
 `XDG_CONFIG_HOME`, then an absolute `HOME/.config`. `state-base` uses an
 absolute `XDG_STATE_HOME`, then an absolute `HOME/.local/state`. If a base has
 neither source, it uses `<system-temp>/herdr-no-home`.
+
+`PluginContext::resolve` validates the known workspace and focused-pane fields
+while tolerating unknown fields added by Herdr. A present malformed context,
+wrong known-field type, or relative cwd is an error. Installed plugin commands
+run from `HERDR_PLUGIN_ROOT`, so consumers must use the invocation context
+instead of treating the process cwd as the user's repository. `plugin_root()` is
+`Some` only when Herdr supplies an absolute path.
 
 Blank environment values are treated as unset.
 
@@ -137,7 +152,8 @@ Crook v0.1 provides:
 - bounded request/response transport for the Herdr Unix socket;
 - request ID and response-envelope validation;
 - explicit retry safety;
-- plugin ID, socket, state-directory, and config-directory resolution.
+- plugin ID, socket, state-directory, config-directory, installed-root, and
+  invocation-context resolution.
 
 Crook v0.1 does not provide:
 

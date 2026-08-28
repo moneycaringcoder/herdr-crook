@@ -1,7 +1,13 @@
 use std::env;
+use std::error::Error;
 use std::ffi::OsString;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
+use serde_json::{Map, Value};
+
+const PLUGIN_CONTEXT_ENV: &str = "HERDR_PLUGIN_CONTEXT_JSON";
+const PLUGIN_ROOT_ENV: &str = "HERDR_PLUGIN_ROOT";
 const PLUGIN_ID_ENV: &str = "HERDR_PLUGIN_ID";
 const SOCKET_PATH_ENV: &str = "HERDR_SOCKET_PATH";
 const STATE_DIR_ENV: &str = "HERDR_PLUGIN_STATE_DIR";
@@ -9,6 +15,153 @@ const CONFIG_DIR_ENV: &str = "HERDR_PLUGIN_CONFIG_DIR";
 const XDG_STATE_HOME_ENV: &str = "XDG_STATE_HOME";
 const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
 const HOME_ENV: &str = "HOME";
+
+/// Invocation context supplied by Herdr when it launches an installed plugin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginContext {
+    workspace_id: Option<String>,
+    workspace_cwd: Option<PathBuf>,
+    focused_pane_id: Option<String>,
+    focused_pane_cwd: Option<PathBuf>,
+}
+
+impl PluginContext {
+    /// Resolve the installed-plugin invocation context.
+    ///
+    /// A missing or blank `HERDR_PLUGIN_CONTEXT_JSON` is treated as no plugin
+    /// context. A present value is validated rather than falling back to the
+    /// plugin process's current directory.
+    pub fn resolve() -> Result<Option<Self>, PluginContextError> {
+        Self::resolve_with(|| env::var_os(PLUGIN_CONTEXT_ENV))
+    }
+
+    /// The workspace selected when the plugin was invoked.
+    pub fn workspace_id(&self) -> Option<&str> {
+        self.workspace_id.as_deref()
+    }
+
+    /// The absolute filesystem path of the selected workspace.
+    pub fn workspace_cwd(&self) -> Option<&Path> {
+        self.workspace_cwd.as_deref()
+    }
+
+    /// The pane focused when the plugin was invoked.
+    pub fn focused_pane_id(&self) -> Option<&str> {
+        self.focused_pane_id.as_deref()
+    }
+
+    /// The absolute working directory of the focused pane.
+    pub fn focused_pane_cwd(&self) -> Option<&Path> {
+        self.focused_pane_cwd.as_deref()
+    }
+
+    fn resolve_with<F>(variable: F) -> Result<Option<Self>, PluginContextError>
+    where
+        F: FnOnce() -> Option<OsString>,
+    {
+        let Some(raw) = variable() else {
+            return Ok(None);
+        };
+        let raw = raw
+            .into_string()
+            .map_err(|_| PluginContextError::NonUnicode)?;
+        if raw.trim().is_empty() {
+            return Ok(None);
+        }
+
+        let value: Value = serde_json::from_str(&raw).map_err(PluginContextError::MalformedJson)?;
+        let mut object = match value {
+            Value::Object(object) => object,
+            _ => return Err(PluginContextError::NonObject),
+        };
+
+        Ok(Some(Self {
+            workspace_id: optional_string(&mut object, "workspace_id")?,
+            workspace_cwd: optional_absolute_path(&mut object, "workspace_cwd")?,
+            focused_pane_id: optional_string(&mut object, "focused_pane_id")?,
+            focused_pane_cwd: optional_absolute_path(&mut object, "focused_pane_cwd")?,
+        }))
+    }
+}
+
+/// An invalid installed-plugin invocation context.
+#[derive(Debug)]
+pub enum PluginContextError {
+    /// The environment value cannot be represented as Unicode JSON text.
+    NonUnicode,
+    /// The environment value is not valid JSON.
+    MalformedJson(serde_json::Error),
+    /// The JSON value is not an object.
+    NonObject,
+    /// A known field is neither a string nor `null`.
+    InvalidFieldType { field: &'static str },
+    /// A known working-directory field contains a relative path.
+    RelativePath { field: &'static str, path: PathBuf },
+}
+
+impl fmt::Display for PluginContextError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonUnicode => {
+                write!(formatter, "{PLUGIN_CONTEXT_ENV} is not valid Unicode")
+            }
+            Self::MalformedJson(error) => {
+                write!(
+                    formatter,
+                    "{PLUGIN_CONTEXT_ENV} contains malformed JSON: {error}"
+                )
+            }
+            Self::NonObject => {
+                write!(formatter, "{PLUGIN_CONTEXT_ENV} must contain a JSON object")
+            }
+            Self::InvalidFieldType { field } => write!(
+                formatter,
+                "{PLUGIN_CONTEXT_ENV} field `{field}` must be a string or null"
+            ),
+            Self::RelativePath { field, path } => write!(
+                formatter,
+                "{PLUGIN_CONTEXT_ENV} field `{field}` must be an absolute path, got `{}`",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl Error for PluginContextError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MalformedJson(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+fn optional_string(
+    object: &mut Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<String>, PluginContextError> {
+    match object.remove(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(PluginContextError::InvalidFieldType { field }),
+    }
+}
+
+fn optional_absolute_path(
+    object: &mut Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<PathBuf>, PluginContextError> {
+    let Some(value) = optional_string(object, field)? else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        Ok(Some(path))
+    } else {
+        Err(PluginContextError::RelativePath { field, path })
+    }
+}
 
 /// The plugin identity and filesystem locations supplied by herdr or resolved
 /// from the user's environment.
@@ -18,6 +171,7 @@ pub struct PluginEnv {
     socket_path: PathBuf,
     state_dir: PathBuf,
     config_dir: PathBuf,
+    plugin_root: Option<PathBuf>,
 }
 
 impl PluginEnv {
@@ -47,6 +201,13 @@ impl PluginEnv {
         &self.config_dir
     }
 
+    /// The absolute root directory of the installed plugin, when supplied by
+    /// Herdr. Installed plugin commands run from this directory, so it is not an
+    /// invocation-repository fallback.
+    pub fn plugin_root(&self) -> Option<&Path> {
+        self.plugin_root.as_deref()
+    }
+
     fn resolve_with<F>(default_plugin_id: &str, mut variable: F, temp_dir: &Path) -> Self
     where
         F: FnMut(&str) -> Option<OsString>,
@@ -58,6 +219,7 @@ impl PluginEnv {
         let injected_socket = non_blank_path(variable(SOCKET_PATH_ENV));
         let injected_state = non_blank_path(variable(STATE_DIR_ENV));
         let injected_config = non_blank_path(variable(CONFIG_DIR_ENV));
+        let plugin_root = absolute_path(variable(PLUGIN_ROOT_ENV));
 
         let home = absolute_path(variable(HOME_ENV));
         let no_home_base = temp_dir.join("herdr-no-home");
@@ -86,6 +248,7 @@ impl PluginEnv {
             socket_path,
             state_dir,
             config_dir,
+            plugin_root,
         }
     }
 }
@@ -132,6 +295,114 @@ mod tests {
             .collect()
     }
 
+    fn resolve_context(
+        value: Option<OsString>,
+    ) -> Result<Option<PluginContext>, PluginContextError> {
+        PluginContext::resolve_with(|| value)
+    }
+
+    #[test]
+    fn plugin_context_is_absent_when_missing_or_blank() {
+        assert!(resolve_context(None).unwrap().is_none());
+        assert!(resolve_context(Some(OsString::from(" \t\n")))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn plugin_context_parses_observed_fields() {
+        let resolved = resolve_context(Some(OsString::from(
+            r#"{
+                "workspace_id": "workspace-1",
+                "workspace_cwd": "/work/project",
+                "focused_pane_id": "pane-2",
+                "focused_pane_cwd": "/work/project/crate"
+            }"#,
+        )))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(resolved.workspace_id(), Some("workspace-1"));
+        assert_eq!(resolved.workspace_cwd(), Some(Path::new("/work/project")));
+        assert_eq!(resolved.focused_pane_id(), Some("pane-2"));
+        assert_eq!(
+            resolved.focused_pane_cwd(),
+            Some(Path::new("/work/project/crate"))
+        );
+    }
+
+    #[test]
+    fn plugin_context_tolerates_unknown_fields_and_empty_known_values() {
+        let resolved = resolve_context(Some(OsString::from(
+            r#"{
+                "workspace_id": null,
+                "workspace_cwd": "",
+                "focused_pane_id": "  ",
+                "future_context": {"version": 2}
+            }"#,
+        )))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(resolved.workspace_id(), None);
+        assert_eq!(resolved.workspace_cwd(), None);
+        assert_eq!(resolved.focused_pane_id(), None);
+        assert_eq!(resolved.focused_pane_cwd(), None);
+    }
+
+    #[test]
+    fn plugin_context_rejects_malformed_json() {
+        let error = resolve_context(Some(OsString::from("{"))).unwrap_err();
+
+        assert!(matches!(&error, PluginContextError::MalformedJson(_)));
+        assert!(error.to_string().contains("malformed JSON"));
+    }
+
+    #[test]
+    fn plugin_context_rejects_non_object_json() {
+        let error = resolve_context(Some(OsString::from("[]"))).unwrap_err();
+
+        assert!(matches!(&error, PluginContextError::NonObject));
+        assert!(error.to_string().contains("must contain a JSON object"));
+    }
+
+    #[test]
+    fn plugin_context_rejects_wrong_known_field_type() {
+        let error = resolve_context(Some(OsString::from(r#"{"workspace_id": 1}"#))).unwrap_err();
+
+        assert!(matches!(
+            error,
+            PluginContextError::InvalidFieldType {
+                field: "workspace_id"
+            }
+        ));
+    }
+
+    #[test]
+    fn plugin_context_rejects_relative_cwd() {
+        let error = resolve_context(Some(OsString::from(r#"{"focused_pane_cwd": "relative"}"#)))
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            PluginContextError::RelativePath {
+                field: "focused_pane_cwd",
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("must be an absolute path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_context_rejects_non_utf8_json() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let error = resolve_context(Some(OsString::from_vec(vec![0xff]))).unwrap_err();
+        assert!(matches!(&error, PluginContextError::NonUnicode));
+        assert!(error.to_string().contains("not valid Unicode"));
+    }
+
     #[test]
     fn injected_values_win_unchanged() {
         let vars = text_vars(&[
@@ -139,6 +410,7 @@ mod tests {
             (SOCKET_PATH_ENV, "relative/socket"),
             (STATE_DIR_ENV, "relative/state"),
             (CONFIG_DIR_ENV, "relative/config"),
+            (PLUGIN_ROOT_ENV, "/plugins/example"),
             (XDG_CONFIG_HOME_ENV, "/ignored/config"),
             (XDG_STATE_HOME_ENV, "/ignored/state"),
             (HOME_ENV, "/ignored/home"),
@@ -150,6 +422,7 @@ mod tests {
         assert_eq!(resolved.socket_path(), Path::new("relative/socket"));
         assert_eq!(resolved.state_dir(), Path::new("relative/state"));
         assert_eq!(resolved.config_dir(), Path::new("relative/config"));
+        assert_eq!(resolved.plugin_root(), Some(Path::new("/plugins/example")));
     }
 
     #[test]
@@ -159,6 +432,7 @@ mod tests {
             (SOCKET_PATH_ENV, " "),
             (STATE_DIR_ENV, "\t"),
             (CONFIG_DIR_ENV, "\n"),
+            (PLUGIN_ROOT_ENV, " "),
             (XDG_CONFIG_HOME_ENV, "  "),
             (XDG_STATE_HOME_ENV, ""),
             (HOME_ENV, "/home/tester"),
@@ -179,6 +453,16 @@ mod tests {
             resolved.config_dir(),
             Path::new("/home/tester/.config/herdr/plugins/config/default.plugin")
         );
+        assert_eq!(resolved.plugin_root(), None);
+    }
+
+    #[test]
+    fn relative_plugin_root_is_unset() {
+        let vars = text_vars(&[(PLUGIN_ROOT_ENV, "relative/plugin")]);
+
+        let resolved = resolve(&vars, Path::new("/tmp/ignored"));
+
+        assert_eq!(resolved.plugin_root(), None);
     }
 
     #[test]

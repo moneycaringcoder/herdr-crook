@@ -4,6 +4,11 @@ All notable changes to Crook are recorded here. Crook follows [Semantic Versioni
 
 ## [Unreleased]
 
+### Added
+
+- Typed validation for Herdr's installed-plugin invocation context.
+- Installed plugin-root resolution through `PluginEnv`.
+
 ## [0.1.0] - 2026-08-28
 
 ### Added
