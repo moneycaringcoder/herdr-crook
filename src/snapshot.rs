@@ -176,7 +176,7 @@ impl<'a> Records<'a> {
     pub fn get(self, index: usize) -> Option<Record<'a>> {
         self.values.get(index).map(|value| Record {
             value,
-            location: Location::new(self.collection, index),
+            location: Location::new(self.collection, index, value),
         })
     }
 
@@ -188,7 +188,7 @@ impl<'a> Records<'a> {
             .enumerate()
             .map(move |(index, value)| Record {
                 value,
-                location: Location::new(collection, index),
+                location: Location::new(collection, index, value),
             })
     }
 }
@@ -197,7 +197,7 @@ impl<'a> Records<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct Record<'a> {
     value: &'a Value,
-    location: Location,
+    location: Location<'a>,
 }
 
 impl<'a> Record<'a> {
@@ -264,8 +264,10 @@ impl<'a> Record<'a> {
     /// Returns an object field as a nested record view.
     pub fn object(self, field: &'static str) -> Option<Record<'a>> {
         let value = self.value.get(field).filter(|value| value.is_object())?;
-        let location = self.location.nested(field)?;
-        Some(Record { value, location })
+        Some(Record {
+            value,
+            location: self.location,
+        })
     }
 
     /// Requires an object field and returns it as a nested record view.
@@ -328,58 +330,66 @@ impl<'a> Record<'a> {
 
     fn error(self, expected: &'static str) -> SnapshotError {
         SnapshotError::InvalidField {
-            path: self.location.path(),
+            path: self.location.path(self.value),
             expected,
         }
     }
 
     fn field_error(self, field: &str, expected: &'static str) -> SnapshotError {
-        let mut path = self.location.path();
+        let mut path = self.location.path(self.value);
         path.push('.');
         path.push_str(field);
         SnapshotError::InvalidField { path, expected }
     }
 }
 
-const MAX_OBJECT_DEPTH: usize = 2;
-
 #[derive(Debug, Clone, Copy)]
-struct Location {
+struct Location<'a> {
     collection: &'static str,
     index: usize,
-    fields: [&'static str; MAX_OBJECT_DEPTH],
-    depth: u8,
+    root: &'a Value,
 }
 
-impl Location {
-    fn new(collection: &'static str, index: usize) -> Self {
+impl<'a> Location<'a> {
+    fn new(collection: &'static str, index: usize, root: &'a Value) -> Self {
         Self {
             collection,
             index,
-            fields: [""; MAX_OBJECT_DEPTH],
-            depth: 0,
+            root,
         }
     }
 
-    fn nested(mut self, field: &'static str) -> Option<Self> {
-        let slot = self.fields.get_mut(usize::from(self.depth))?;
-        *slot = field;
-        self.depth += 1;
-        Some(self)
-    }
-
-    fn path(self) -> String {
+    fn path(self, value: &Value) -> String {
         use fmt::Write as _;
 
         let mut path = String::new();
         write!(path, "session.snapshot.{}[{}]", self.collection, self.index)
             .expect("writing to a String cannot fail");
-        for field in &self.fields[..usize::from(self.depth)] {
-            path.push('.');
-            path.push_str(field);
+        if !std::ptr::eq(self.root, value) {
+            let found = append_object_path(self.root, value, &mut path);
+            debug_assert!(found, "nested record must remain below its root record");
         }
         path
     }
+}
+
+fn append_object_path(current: &Value, target: &Value, path: &mut String) -> bool {
+    let Some(fields) = current.as_object() else {
+        return false;
+    };
+    for (field, value) in fields {
+        if !value.is_object() {
+            continue;
+        }
+        let original_len = path.len();
+        path.push('.');
+        path.push_str(field);
+        if std::ptr::eq(value, target) || append_object_path(value, target, path) {
+            return true;
+        }
+        path.truncate(original_len);
+    }
+    false
 }
 
 fn envelope_error(result: &Value, message: impl Into<String>) -> SnapshotError {
@@ -518,6 +528,42 @@ mod tests {
         assert_eq!(
             checkout_path(&snapshot).expect("checkout path"),
             Path::new("/repo/./alpha")
+        );
+    }
+
+    #[test]
+    fn object_views_and_errors_support_arbitrary_nesting() {
+        let mut result = valid_result();
+        result["snapshot"]["workspaces"][0]["level_0"] = json!({"decoy": {}});
+        result["snapshot"]["workspaces"][0]["level_1"] = json!({
+            "level_2": {
+                "level_3": {
+                    "level_4": {}
+                }
+            }
+        });
+        let snapshot = Snapshot::from_result(result).expect("valid snapshot");
+
+        let level_4 = snapshot
+            .workspaces()
+            .get(0)
+            .expect("workspace")
+            .require_object("level_1")
+            .expect("level 1")
+            .require_object("level_2")
+            .expect("level 2")
+            .require_object("level_3")
+            .expect("level 3")
+            .require_object_or_null("level_4")
+            .expect("level 4 has an allowed type")
+            .expect("level 4 is present");
+
+        assert_eq!(
+            level_4
+                .require_text("missing")
+                .expect_err("missing leaf")
+                .to_string(),
+            "session.snapshot.workspaces[0].level_1.level_2.level_3.level_4.missing must be a string"
         );
     }
 

@@ -555,6 +555,39 @@ mod tests {
     }
 
     #[test]
+    fn metadata_applies_ttl_per_chunk_not_per_patch() {
+        let (socket, server) = spawn_server(|listener| {
+            let mut clear_stream = accept(&listener);
+            let clear_request = read_request(&mut clear_stream);
+            assert_eq!(
+                clear_request["params"]["tokens"]
+                    .as_object()
+                    .expect("clear token patch")
+                    .len(),
+                16
+            );
+            assert!(clear_request["params"].get("ttl_ms").is_none());
+            write_result(&mut clear_stream, &clear_request, json!({"type": "ok"}));
+
+            let mut set_stream = accept(&listener);
+            let set_request = read_request(&mut set_stream);
+            assert_eq!(set_request["params"]["tokens"], json!({"set": "value"}));
+            assert_eq!(set_request["params"]["ttl_ms"], 5_000);
+            write_result(&mut set_stream, &set_request, json!({"type": "ok"}));
+        });
+        let client = Client::new(&socket.path, "rpc-metadata-chunk-ttl");
+        let mut tokens = (0..16)
+            .map(|index| (format!("clear-{index:02}"), None))
+            .collect::<BTreeMap<_, _>>();
+        tokens.insert("set".to_string(), Some("value".to_string()));
+
+        workspace_report_metadata(&client, "w1", "plugin.test", &tokens, Some(5_000))
+            .expect("chunked report");
+
+        server.join().expect("mock server");
+    }
+
+    #[test]
     fn worktree_list_supports_both_observed_selectors() {
         let (socket, server) = spawn_server(|listener| {
             let mut cwd_stream = accept(&listener);

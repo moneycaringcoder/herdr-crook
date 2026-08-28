@@ -149,7 +149,8 @@ On Unix, `crook::fs` provides atomic replacement with file and containing
 directory sync, an explicit-mode variant for private files, mode-aware durable
 create-new publication from in-memory bytes, non-clobbering `0o600` path
 backups, and a directory-scoped RAII `flock` guard. A directory-sync error after
-publication is returned without rolling back the already-published file.
+publication is returned without rolling back the already-published file. Newly
+created parent directories are not separately synced into their ancestors.
 
 ## Plugin environment
 

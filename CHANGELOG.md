@@ -2,6 +2,22 @@
 
 All notable changes to Crook are recorded here. Crook follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Preserve arbitrarily deep snapshot object views and their exact validation
+  paths instead of treating the third nested object as absent.
+- Keep explicit-mode temporary files private until staging completes, apply the
+  requested mode after writing, and clean up staged files during unwinding.
+- Prevent fixture-server shutdown from blocking on accepted sockets whose I/O
+  timeouts could not be installed.
+
+### Documentation
+
+- Clarify that newly created parent directories are not separately synced into
+  their ancestors.
+
 ## [0.2.1] - 2026-08-28
 
 ### Added
@@ -33,6 +49,7 @@ All notable changes to Crook are recorded here. Crook follows [Semantic Versioni
 
 [Semantic Versioning]: https://semver.org/
 
+[Unreleased]: https://github.com/moneycaringcoder/herdr-crook/compare/v0.2.1...HEAD
 [0.2.1]: https://github.com/moneycaringcoder/herdr-crook/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/moneycaringcoder/herdr-crook/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/moneycaringcoder/herdr-crook/releases/tag/v0.1.0
