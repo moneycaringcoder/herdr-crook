@@ -261,6 +261,10 @@ pub struct EnvGuard {
 
 impl EnvGuard {
     /// Acquires the process-global test environment lock.
+    ///
+    /// The lock is not reentrant: constructing a second guard on a thread that
+    /// already holds one deadlocks. Create exactly one guard per test and pass
+    /// it to any helper that needs to mutate the environment.
     pub fn new() -> Self {
         Self {
             saved: Vec::new(),
@@ -355,16 +359,19 @@ fn serve(
                 let Ok(Some(raw)) = read_request(&mut stream, &stop) else {
                     continue;
                 };
-                let Ok(request) = serde_json::from_slice::<Value>(&raw) else {
-                    continue;
-                };
+                let parsed = serde_json::from_slice::<Value>(&raw).ok();
                 {
                     let mut captured = lock_unpoisoned(&captured);
-                    captured.parsed.push(request.clone());
                     captured.raw.push(raw);
+                    if let Some(request) = &parsed {
+                        captured.parsed.push(request.clone());
+                    }
                 }
                 if let Some(reply) = replies.pop_front() {
-                    let request_id = request.get("id").cloned().unwrap_or(Value::Null);
+                    let request_id = parsed
+                        .as_ref()
+                        .and_then(|request| request.get("id").cloned())
+                        .unwrap_or(Value::Null);
                     let _ = write_reply(&mut stream, reply, request_id, &stop);
                 }
             }
@@ -414,7 +421,7 @@ fn write_reply(
             let mut envelope = Map::new();
             envelope.insert("id".into(), request_id);
             envelope.insert("result".into(), result);
-            write_json_line(stream, &Value::Object(envelope))
+            write_json_line(stream, &Value::Object(envelope), stop)
         }
         FixtureReply::Error { code, message } => {
             let mut error = Map::new();
@@ -423,52 +430,85 @@ fn write_reply(
             let mut envelope = Map::new();
             envelope.insert("id".into(), request_id);
             envelope.insert("error".into(), Value::Object(error));
-            write_json_line(stream, &Value::Object(envelope))
+            write_json_line(stream, &Value::Object(envelope), stop)
         }
         FixtureReply::Captured(captured) => {
-            write_json_line(stream, &captured.with_request_id_value(request_id))
+            write_json_line(stream, &captured.with_request_id_value(request_id), stop)
         }
         FixtureReply::Raw(bytes) => {
-            stream.write_all(&bytes)?;
+            write_all_retrying(stream, &bytes, stop)?;
             stream.flush()
         }
-        FixtureReply::Oversize => write_oversize(stream),
+        FixtureReply::Oversize => write_oversize(stream, stop),
         FixtureReply::Endless => write_endless(stream, stop),
         FixtureReply::Eof => Ok(()),
     }
 }
 
-fn write_json_line(stream: &mut UnixStream, value: &Value) -> io::Result<()> {
+fn write_all_retrying(
+    writer: &mut impl Write,
+    mut bytes: &[u8],
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        if stop.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "fixture server is stopping",
+            ));
+        }
+        match writer.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn write_json_line(stream: &mut UnixStream, value: &Value, stop: &AtomicBool) -> io::Result<()> {
     let mut response = serde_json::to_vec(value).map_err(io::Error::other)?;
     response.push(b'\n');
-    stream.write_all(&response)?;
+    write_all_retrying(stream, &response, stop)?;
     stream.flush()
 }
 
-fn write_oversize(stream: &mut UnixStream) -> io::Result<()> {
+fn write_oversize(stream: &mut UnixStream, stop: &AtomicBool) -> io::Result<()> {
     let chunk = [b'x'; 8192];
     let mut remaining = MAX_RESPONSE_BYTES + 1;
     while remaining > 0 {
         let write = remaining.min(chunk.len());
-        stream.write_all(&chunk[..write])?;
+        write_all_retrying(stream, &chunk[..write], stop)?;
         remaining -= write;
     }
-    stream.write_all(b"\n")?;
+    write_all_retrying(stream, b"\n", stop)?;
     stream.flush()
 }
 
-fn write_endless(stream: &mut UnixStream, stop: &AtomicBool) -> io::Result<()> {
+fn write_endless(writer: &mut impl Write, stop: &AtomicBool) -> io::Result<()> {
     let chunk = [b'y'; 8192];
     while !stop.load(Ordering::Acquire) {
-        match stream.write_all(&chunk) {
-            Ok(()) => {}
+        match writer.write(&chunk) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(_) => {}
             Err(error)
                 if matches!(
                     error.kind(),
-                    io::ErrorKind::BrokenPipe
-                        | io::ErrorKind::ConnectionReset
+                    io::ErrorKind::Interrupted
                         | io::ErrorKind::WouldBlock
                         | io::ErrorKind::TimedOut
+                ) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
                 ) =>
             {
                 return Ok(())
@@ -483,4 +523,78 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    enum WriteStep {
+        Write(usize),
+        Error(io::ErrorKind),
+    }
+
+    struct ScriptedWriter {
+        steps: VecDeque<WriteStep>,
+        written: Vec<u8>,
+    }
+
+    impl ScriptedWriter {
+        fn new(steps: impl IntoIterator<Item = WriteStep>) -> Self {
+            Self {
+                steps: steps.into_iter().collect(),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for ScriptedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            match self.steps.pop_front().expect("unexpected write attempt") {
+                WriteStep::Write(limit) => {
+                    let written = limit.min(bytes.len());
+                    self.written.extend_from_slice(&bytes[..written]);
+                    Ok(written)
+                }
+                WriteStep::Error(kind) => Err(kind.into()),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn retrying_writer_preserves_partial_writes_across_transient_errors() {
+        let mut writer = ScriptedWriter::new([
+            WriteStep::Write(2),
+            WriteStep::Error(io::ErrorKind::TimedOut),
+            WriteStep::Error(io::ErrorKind::WouldBlock),
+            WriteStep::Error(io::ErrorKind::Interrupted),
+            WriteStep::Write(usize::MAX),
+        ]);
+        let stop = AtomicBool::new(false);
+
+        write_all_retrying(&mut writer, b"abcdef", &stop).expect("retry transient writes");
+
+        assert_eq!(writer.written, b"abcdef");
+        assert!(writer.steps.is_empty());
+    }
+
+    #[test]
+    fn endless_writer_continues_through_timeouts_until_peer_closes() {
+        let mut writer = ScriptedWriter::new([
+            WriteStep::Error(io::ErrorKind::WouldBlock),
+            WriteStep::Error(io::ErrorKind::TimedOut),
+            WriteStep::Write(1),
+            WriteStep::Error(io::ErrorKind::BrokenPipe),
+        ]);
+        let stop = AtomicBool::new(false);
+
+        write_endless(&mut writer, &stop).expect("peer close ends endless reply");
+
+        assert_eq!(writer.written, b"y");
+        assert!(writer.steps.is_empty());
+    }
 }

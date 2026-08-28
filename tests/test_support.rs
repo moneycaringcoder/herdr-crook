@@ -87,6 +87,40 @@ fn scripted_replies_are_consumed_in_order() {
 }
 
 #[test]
+fn malformed_request_is_captured_and_consumes_its_reply() {
+    let server = FixtureServer::new([
+        FixtureReply::result(json!("malformed-request-reply")),
+        FixtureReply::result(json!("valid-request-reply")),
+    ])
+    .expect("start fixture server");
+    let mut raw_client =
+        UnixStream::connect(server.socket_path()).expect("connect malformed fixture client");
+    raw_client
+        .write_all(b"not-json\n")
+        .expect("write malformed request");
+    let mut raw_response = Vec::new();
+    raw_client
+        .read_to_end(&mut raw_response)
+        .expect("read malformed request reply");
+
+    assert_eq!(
+        serde_json::from_slice::<Value>(&raw_response).expect("parse null-ID fixture reply"),
+        json!({"id": null, "result": "malformed-request-reply"})
+    );
+
+    let client = Client::new(server.socket_path(), "after-malformed");
+    assert_eq!(
+        client
+            .request("test", json!({}), RetrySafety::Never)
+            .expect("second queued reply"),
+        "valid-request-reply"
+    );
+    assert_eq!(server.requests().len(), 1);
+    assert_eq!(server.raw_lines()[0], b"not-json\n");
+    assert_eq!(server.raw_lines().len(), 2);
+}
+
+#[test]
 fn raw_reply_bytes_are_verbatim() {
     let expected = b"raw-without-newline";
     let server = FixtureServer::new([FixtureReply::raw(expected)]).expect("start fixture server");
