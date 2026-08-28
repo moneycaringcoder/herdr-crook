@@ -430,11 +430,8 @@ mod tests {
             match listener.accept() {
                 Ok((stream, _)) => {
                     stream
-                        .set_read_timeout(Some(MOCK_TIMEOUT))
-                        .expect("set mock read timeout");
-                    stream
-                        .set_write_timeout(Some(MOCK_TIMEOUT))
-                        .expect("set mock write timeout");
+                        .set_nonblocking(false)
+                        .expect("make mock stream blocking");
                     return stream;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
