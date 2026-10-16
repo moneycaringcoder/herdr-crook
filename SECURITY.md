@@ -12,7 +12,7 @@ Before the first tagged release, security fixes are made on `main`. After releas
 
 ## Reporting a vulnerability
 
-Report vulnerabilities through [GitHub private vulnerability reporting](https://github.com/moneycaringcoder/herdr-crook/security/advisories/new). Do not open a public issue.
+Report vulnerabilities through [GitHub private vulnerability reporting](https://github.com/mcc0x/herdr-crook/security/advisories/new). Do not open a public issue.
 
 Include:
 
