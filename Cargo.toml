@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.80"
 description = "Shared infrastructure for Herdr plugins"
 license = "MIT"
-repository = "https://github.com/moneycaringcoder/herdr-crook"
+repository = "https://github.com/mcc0x/herdr-crook"
 
 [features]
 default = []

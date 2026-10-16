@@ -36,7 +36,7 @@ This Code of Conduct applies within all community spaces and when an individual 
 
 ## Enforcement
 
-Report unacceptable behavior privately through the repository's [private reporting form](https://github.com/moneycaringcoder/herdr-crook/security/advisories/new). Begin the report title with `Conduct:`. Do not open a public issue when doing so would expose private information.
+Report unacceptable behavior privately through the repository's [private reporting form](https://github.com/mcc0x/herdr-crook/security/advisories/new). Begin the report title with `Conduct:`. Do not open a public issue when doing so would expose private information.
 
 All reports will be reviewed and investigated fairly. Community leaders will respect the privacy and security of reporters.
 
